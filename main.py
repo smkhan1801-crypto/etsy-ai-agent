@@ -14,10 +14,23 @@ import requests
 import redis
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from openai import OpenAI
 
 app = FastAPI()
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Always return JSON so the optimizer UI can show the real backend error
+    # instead of failing with "Unexpected token I" while parsing "Internal Server Error".
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "detail": f"{type(exc).__name__}: {str(exc) or 'Unknown server error'}",
+            "path": str(request.url.path),
+        },
+    )
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=25, max_retries=1)
 
@@ -1762,12 +1775,23 @@ Return ONLY valid JSON:
 }}
 """
 
-    response = client.responses.create(
-        model="gpt-5.6-luna",
-        input=prompt,
-    )
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = client.responses.create(
+                model="gpt-5.6-luna",
+                input=prompt,
+            )
+            text = getattr(response, "output_text", "") or ""
+            return parse_listing_json(text)
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                # A compact retry avoids failures caused by an overly long or
+                # partially malformed model response while keeping the same rules.
+                prompt = prompt + "\n\nFINAL REMINDER: Return ONLY one compact JSON object. No markdown, no commentary, no code fences. Ensure all JSON strings escape newlines and quotes correctly."
 
-    return parse_listing_json(response.output_text)
+    raise RuntimeError(f"Optimizer AI response failed after 2 attempts: {type(last_error).__name__}: {last_error}")
 
 
 @app.get("/optimizer", response_class=HTMLResponse)
@@ -1847,6 +1871,10 @@ def optimizer_page():
     </form>
   </div>
   <div id="result" class="hidden">
+    <div class="card" style="text-align:center">
+      <button type="button" id="copyAll" style="margin-top:0">📋 Copy All SEO Content</button>
+      <p class="muted" style="margin:9px 0 0">Copies the optimized title, 13 tags and description together.</p>
+    </div>
     <div class="card">
       <div class="section-title"><h2>🏷️ Recommended SEO Title</h2><button type="button" class="copy" data-copy="title">Copy</button></div>
       <div id="title" class="title-box"></div><p id="titleCount" class="muted"></p>
@@ -1904,6 +1932,23 @@ def optimizer_page():
         <p class="muted">The breakdown shows how the optimizer scores listing structure. It is not Etsy's internal ranking formula.</p>
       </div>
       <div class="card full">
+        <div class="section-title"><h2>🔄 Current vs Optimized</h2></div>
+        <div class="grid" style="margin-top:0">
+          <div>
+            <h3 style="margin-top:0">Current Title</h3>
+            <div id="compareCurrentTitle" class="title-box"></div>
+            <h3>Current Tags</h3>
+            <div id="compareCurrentTags" class="tags"></div>
+          </div>
+          <div>
+            <h3 style="margin-top:0">Optimized Title</h3>
+            <div id="compareOptimizedTitle" class="title-box"></div>
+            <h3>Optimized Tags</h3>
+            <div id="compareOptimizedTags" class="tags"></div>
+          </div>
+        </div>
+      </div>
+      <div class="card full">
         <div class="section-title"><h2>📌 Current Listing</h2></div>
         <div class="meta">
           <div><strong>CURRENT TITLE</strong><span id="currentTitle"></span></div>
@@ -1927,6 +1972,9 @@ function render(data) {
   $('description').textContent=latest.description;
   listInto($('strengths'),a.strengths); listInto($('weaknesses'),a.weaknesses); listInto($('opportunities'),a.seo_opportunities); listInto($('changes'),o.changes_summary);
   $('volumeNote').textContent=o.search_volume_note||''; $('currentTitle').textContent=data.current_listing?.title||''; $('listingId').textContent=data.listing_id||'';
+  $('compareCurrentTitle').textContent=data.current_listing?.title||''; $('compareOptimizedTitle').textContent=latest.title||'';
+  const curTags=data.current_listing?.tags||[]; $('compareCurrentTags').innerHTML=''; curTags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareCurrentTags').appendChild(s);});
+  $('compareOptimizedTags').innerHTML=''; latest.tags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareOptimizedTags').appendChild(s);});
   const sc=data.seo_score||{}; $('currentScore').textContent=(sc.current_score ?? '—')+'/100'; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('improvement').textContent=(sc.improvement>=0?'+':'')+(sc.improvement ?? '—'); $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
   const bd=sc.breakdown||{};
   const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; $(el).textContent=(val ?? '—'); $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
@@ -1937,8 +1985,9 @@ function render(data) {
   renderPills('primaryKeywords',ki.primary_keywords); renderPills('secondaryKeywords',ki.secondary_keywords); renderPills('longTailKeywords',ki.long_tail_keywords); renderPills('buyerIntentKeywords',ki.buyer_intent_keywords); renderPills('avoidKeywords',ki.avoid_keywords);
   $('result').classList.remove('hidden');
 }
-$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.detail||'Analysis failed');if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
+$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
 document.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{const key=btn.dataset.copy;const value=key==='tags'?latest.tags.join(', '):latest[key];try{await navigator.clipboard.writeText(value||'');const old=btn.textContent;btn.textContent='Copied ✓';setTimeout(()=>btn.textContent=old,1200);}catch(_){btn.textContent='Copy failed';}}));
+$('copyAll').addEventListener('click',async()=>{const text=`TITLE\n${latest.title}\n\n13 TAGS\n${latest.tags.map((x,i)=>`${i+1}. ${x}`).join('\n')}\n\nDESCRIPTION\n${latest.description}`;try{await navigator.clipboard.writeText(text);const b=$('copyAll');b.textContent='Copied ✓';setTimeout(()=>b.textContent='📋 Copy All SEO Content',1400);}catch(_){$('copyAll').textContent='Copy failed';}});
 </script>
 </body>
 </html>
