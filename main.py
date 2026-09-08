@@ -1128,6 +1128,57 @@ def validate_listing(candidate):
     return errors
 
 
+
+def seo_score_report(current_listing, optimized_result, market_signals, validation_errors):
+    """Directional SEO/readability score; not an Etsy ranking score."""
+    def score_title(title):
+        title = str(title or '').strip()
+        ws = words(title)
+        score = 0
+        if title: score += 20
+        if 8 <= len(ws) <= 15: score += 15
+        elif 5 <= len(ws) <= 18: score += 8
+        if len(title) <= 140: score += 15
+        if len(ws) == len(set(ws)): score += 10
+        if title and ws: score += 10
+        return min(score, 70)
+
+    def score_tags(tags):
+        tags = tags if isinstance(tags, list) else []
+        if not tags: return 0
+        valid = [str(t).strip() for t in tags if str(t).strip()]
+        length_ok = sum(len(t) <= 20 for t in valid)
+        unique = len({t.lower() for t in valid})
+        return min(20, round((length_ok / 13) * 12) + (4 if len(valid) == 13 else 0) + (4 if unique == len(valid) else 0))
+
+    def score_description(description):
+        text = str(description or '').strip()
+        if not text: return 0
+        return 10 if len(text) >= 80 else 6
+
+    current_title = current_listing.get('title', '')
+    current_tags = current_listing.get('tags', []) or []
+    current_description = current_listing.get('description', '')
+    optimized_title = optimized_result.get('recommended_title', '')
+    optimized_tags = optimized_result.get('recommended_tags', []) or []
+    optimized_description = optimized_result.get('recommended_description', '')
+
+    current_score = min(100, score_title(current_title) + score_tags(current_tags) + score_description(current_description))
+    optimized_score = min(100, score_title(optimized_title) + score_tags(optimized_tags) + score_description(optimized_description))
+    if validation_errors:
+        optimized_score = max(0, optimized_score - min(25, len(validation_errors) * 5))
+
+    signals = market_signals.get('high_signal_phrases', []) if isinstance(market_signals, dict) else []
+    signal_count = len(signals)
+    return {
+        'current_score': current_score,
+        'optimized_score': optimized_score,
+        'improvement': optimized_score - current_score,
+        'grade': 'A' if optimized_score >= 90 else 'B' if optimized_score >= 80 else 'C' if optimized_score >= 70 else 'D' if optimized_score >= 60 else 'E',
+        'market_signal_count': signal_count,
+        'note': 'Directional optimization score for structure, relevance and marketplace-signal usage. It is not an Etsy ranking prediction.'
+    }
+
 def rewrite_listing(candidate, similarity_matches, claim_problems):
     prompt = f"""
 Rewrite this Etsy listing into a fresh, original version.
@@ -1738,8 +1789,12 @@ def optimizer_page():
   .keyword:last-child { border-bottom:0; }
   .keyword b { font-size:14px; }
   .keyword span { display:block; color:#aab6d3; font-size:13px; margin-top:3px; }
+  .score-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+  .score-box { background:#0b1223; border:1px solid #293957; border-radius:10px; padding:14px; text-align:center; }
+  .score-box strong { display:block; color:#8f9fbe; font-size:11px; margin-bottom:6px; }
+  .score-box span { font-size:24px; font-weight:850; }
   .hidden { display:none; }
-  @media(max-width:760px) { .grid { grid-template-columns:1fr; } .full { grid-column:auto; } .meta { grid-template-columns:1fr; } h1 { font-size:27px; } }
+  @media(max-width:760px) { .grid { grid-template-columns:1fr; } .full { grid-column:auto; } .meta { grid-template-columns:1fr; } .score-grid { grid-template-columns:1fr 1fr; } h1 { font-size:27px; } }
 </style>
 </head>
 <body>
@@ -1783,6 +1838,16 @@ def optimizer_page():
         <div class="section-title"><h2>🔄 What Changed</h2></div><ul id="changes"></ul><p id="volumeNote" class="muted"></p>
       </div>
       <div class="card full">
+        <div class="section-title"><h2>📈 SEO Score & Comparison</h2></div>
+        <div class="score-grid">
+          <div class="score-box"><strong>CURRENT SCORE</strong><span id="currentScore">—</span></div>
+          <div class="score-box"><strong>OPTIMIZED SCORE</strong><span id="optimizedScore">—</span></div>
+          <div class="score-box"><strong>IMPROVEMENT</strong><span id="improvement">—</span></div>
+          <div class="score-box"><strong>GRADE</strong><span id="grade">—</span></div>
+        </div>
+        <p id="scoreNote" class="muted"></p>
+      </div>
+      <div class="card full">
         <div class="section-title"><h2>📌 Current Listing</h2></div>
         <div class="meta">
           <div><strong>CURRENT TITLE</strong><span id="currentTitle"></span></div>
@@ -1806,6 +1871,7 @@ function render(data) {
   $('description').textContent=latest.description;
   listInto($('strengths'),a.strengths); listInto($('weaknesses'),a.weaknesses); listInto($('opportunities'),a.seo_opportunities); listInto($('changes'),o.changes_summary);
   $('volumeNote').textContent=o.search_volume_note||''; $('currentTitle').textContent=data.current_listing?.title||''; $('listingId').textContent=data.listing_id||'';
+  const sc=data.seo_score||{}; $('currentScore').textContent=(sc.current_score ?? '—')+'/100'; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('improvement').textContent=(sc.improvement>=0?'+':'')+(sc.improvement ?? '—'); $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
   $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(sp);$('keywords').appendChild(d);});
   $('result').classList.remove('hidden');
 }
@@ -1888,6 +1954,16 @@ async def analyze_existing_listing(
         "description": optimized.get("recommended_description", ""),
     }
     validation_errors = validate_listing(candidate)
+    seo_score = seo_score_report(
+        {
+            "title": listing.get("title", ""),
+            "tags": listing.get("tags", []) or [],
+            "description": listing.get("description", ""),
+        },
+        optimized,
+        market_signals,
+        validation_errors,
+    )
 
     return {
         "status": "success" if not validation_errors else "validation_failed",
@@ -1907,6 +1983,7 @@ async def analyze_existing_listing(
         },
         "market_research": market_signals,
         "optimized_result": optimized,
+        "seo_score": seo_score,
         "validation_errors": validation_errors,
         "write_action_performed": False,
     }
