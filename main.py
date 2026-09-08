@@ -19,7 +19,7 @@ from openai import OpenAI
 
 app = FastAPI()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=25, max_retries=1)
 
 ETSY_KEYSTRING = os.getenv("ETSY_API_KEYSTRING")
 ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET")
@@ -33,6 +33,8 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 TOKEN_KEY = "etsy:oauth_token"
 SETTINGS_KEY = "etsy:listing_settings"
+SHOP_CONTEXT_KEY = "etsy:shop_context"
+SHOP_CONTEXT_TTL = 1800
 
 DEFAULT_SHIPPING_TITLE = "Free Shipping"
 DEFAULT_PROCESSING_TITLE = "2–5 days"
@@ -101,7 +103,7 @@ def refresh_etsy_token():
             "client_id": ETSY_KEYSTRING,
             "refresh_token": refresh_token,
         },
-        timeout=30,
+        timeout=15,
     )
 
     if not response.ok:
@@ -162,7 +164,7 @@ def etsy_get(url, access_token=None, params=None):
         url,
         headers=headers,
         params=params,
-        timeout=30,
+        timeout=12,
     )
 
     if access_token and response.status_code == 401:
@@ -173,7 +175,7 @@ def etsy_get(url, access_token=None, params=None):
                 url,
                 headers=etsy_headers(new_access_token),
                 params=params,
-                timeout=30,
+                timeout=12,
             )
 
     return response
@@ -414,90 +416,55 @@ def get_shop_context():
     token_data = get_valid_etsy_token()
 
     if not token_data:
-        raise HTTPException(
-            status_code=401,
-            detail="Etsy account is not connected.",
-        )
+        raise HTTPException(status_code=401, detail="Etsy account is not connected.")
 
     access_token = token_data.get("access_token")
     user_id = access_token.split(".")[0]
 
-    shops_url = (
-        f"https://api.etsy.com/v3/application/users/"
-        f"{user_id}/shops"
-    )
+    cached = redis_client.get(SHOP_CONTEXT_KEY)
+    if cached:
+        try:
+            cached_data = json.loads(cached)
+            if cached_data.get("shop_id"):
+                cached_data["access_token"] = access_token
+                cached_data["user_id"] = user_id
+                return cached_data
+        except Exception:
+            pass
 
-    shop_response = etsy_get(
-        shops_url,
-        access_token,
-    )
-
+    shops_url = f"https://api.etsy.com/v3/application/users/{user_id}/shops"
+    shop_response = etsy_get(shops_url, access_token)
     if not shop_response.ok:
-        raise HTTPException(
-            status_code=shop_response.status_code,
-            detail=shop_response.text,
-        )
+        raise HTTPException(status_code=shop_response.status_code, detail=shop_response.text)
 
     shop_data = shop_response.json()
     shop = shop_data.get("shop", shop_data)
     shop_id = shop.get("shop_id")
 
-    processing_url = (
-        f"https://api.etsy.com/v3/application/shops/"
-        f"{shop_id}/readiness-state-definitions"
-    )
+    processing_url = f"https://api.etsy.com/v3/application/shops/{shop_id}/readiness-state-definitions"
+    shipping_url = f"https://api.etsy.com/v3/application/shops/{shop_id}/shipping-profiles"
+    taxonomy_url = "https://api.etsy.com/v3/application/seller-taxonomy/nodes"
 
-    processing_response = etsy_get(
-        processing_url,
-        access_token,
-    )
+    processing_response = etsy_get(processing_url, access_token)
+    shipping_response = etsy_get(shipping_url, access_token)
+    taxonomy_response = etsy_get(taxonomy_url, access_token)
 
-    processing_data = (
-        processing_response.json()
-        if processing_response.ok
-        else {}
-    )
-
-    shipping_url = (
-        f"https://api.etsy.com/v3/application/shops/"
-        f"{shop_id}/shipping-profiles"
-    )
-
-    shipping_response = etsy_get(
-        shipping_url,
-        access_token,
-    )
-
-    shipping_data = (
-        shipping_response.json()
-        if shipping_response.ok
-        else {}
-    )
-
-    taxonomy_url = (
-        "https://api.etsy.com/v3/application/seller-taxonomy/nodes"
-    )
-
-    taxonomy_response = etsy_get(
-        taxonomy_url,
-        access_token,
-    )
-
-    taxonomy_data = (
-        taxonomy_response.json()
-        if taxonomy_response.ok
-        else {}
-    )
-
-    return {
-        "access_token": access_token,
-        "user_id": user_id,
+    cached_data = {
         "shop": shop,
         "shop_id": shop_id,
-        "processing": processing_data,
-        "shipping": shipping_data,
-        "taxonomy": taxonomy_data,
+        "processing": processing_response.json() if processing_response.ok else {},
+        "shipping": shipping_response.json() if shipping_response.ok else {},
+        "taxonomy": taxonomy_response.json() if taxonomy_response.ok else {},
     }
+
+    try:
+        redis_client.setex(SHOP_CONTEXT_KEY, SHOP_CONTEXT_TTL, json.dumps(cached_data))
+    except Exception:
+        pass
+
+    cached_data["access_token"] = access_token
+    cached_data["user_id"] = user_id
+    return cached_data
 
 
 def choose_shipping_profile(shipping_data):
@@ -659,7 +626,16 @@ def choose_taxonomy_id(taxonomy_data, product_text):
 
         leaf_bonus = 1 if item["name"] else 0
 
-        score = overlap + jewelry_bonus + leaf_bonus
+        product_type_bonus = 0
+        product_type_terms = {
+            "ring", "earring", "necklace", "bracelet", "pendant",
+            "brooch", "cuff", "chain", "jewelry", "jewellery"
+        }
+        if any(term in tokens for term in product_type_terms):
+            matched_types = tokens & product_type_terms & path_tokens
+            product_type_bonus = 10 if matched_types else 0
+
+        score = overlap + jewelry_bonus + product_type_bonus + leaf_bonus
 
         scored.append((score, item))
 
@@ -842,7 +818,7 @@ def listing_similarity(candidate, existing):
     }
 
 
-def get_own_active_listings(access_token, shop_id, limit=100):
+def get_own_active_listings(access_token, shop_id, limit=50):
     url = (
         f"https://api.etsy.com/v3/application/shops/"
         f"{shop_id}/listings/active"
@@ -876,7 +852,7 @@ def public_competitor_search(keyword, limit=15):
         access_token=None,
         params={
             "keywords": keyword,
-            "limit": min(limit, 100),
+            "limit": min(limit, 5),
             "offset": 0,
             "sort_on": "score",
             "sort_order": "desc",
@@ -921,7 +897,7 @@ def competitor_candidates(candidate):
 
     listings = []
 
-    for query in queries[:2]:
+    for query in queries[:1]:
         try:
             listings.extend(public_competitor_search(query, 15))
         except Exception:
@@ -934,7 +910,7 @@ def competitor_candidates(candidate):
         if listing_id:
             unique[listing_id] = listing
 
-    return list(unique.values())[:30]
+    return list(unique.values())[:5]
 
 
 def originality_report(candidate, own_listings, competitor_listings):
@@ -1201,8 +1177,9 @@ Return a concise analysis covering:
     originality = None
     claim_problems = []
     validation_errors = []
+    competitors = competitor_candidates(listing)
 
-    for attempt in range(4):
+    for attempt in range(2):
         validation_errors = validate_listing(listing)
 
         claim_problems = has_unsupported_claims(
@@ -1210,8 +1187,6 @@ Return a concise analysis covering:
             extra_info,
             extra_info,
         )
-
-        competitors = competitor_candidates(listing)
 
         originality = originality_report(
             listing,
@@ -1226,7 +1201,7 @@ Return a concise analysis covering:
         ):
             break
 
-        if attempt == 3:
+        if attempt == 1:
             return {
                 "status": "blocked_before_draft",
                 "message": (
@@ -1242,6 +1217,8 @@ Return a concise analysis covering:
                 "draft_created": False,
                 "published": False,
             }
+
+        time_guard("originality rewrite")
 
         listing = rewrite_listing(
             listing,
@@ -1347,6 +1324,15 @@ async def create_draft_listing(
     taxonomy_id: str = Form(""),
     image: UploadFile = File(None),
 ):
+    started_at = time.monotonic()
+
+    def time_guard(stage):
+        if time.monotonic() - started_at > 90:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Draft workflow timed out during {stage}. No publish action was performed."
+            )
+
     if price <= 0:
         raise HTTPException(
             status_code=400,
@@ -1394,6 +1380,7 @@ async def create_draft_listing(
         )
 
     context = get_shop_context()
+    time_guard("shop configuration")
 
     # ---------------------------------------------------------------
     # ONE-TIME DEFAULT PROFILES
@@ -1453,6 +1440,7 @@ async def create_draft_listing(
         details,
         seller_claims,
     )
+    time_guard("AI listing generation")
 
     # ---------------------------------------------------------------
     # VALIDATE + REWRITE IF NEEDED
@@ -1466,10 +1454,12 @@ async def create_draft_listing(
         context["access_token"],
         context["shop_id"],
     )
+    time_guard("own-shop originality lookup")
 
     competitors = competitor_candidates(listing)
+    time_guard("marketplace originality lookup")
 
-    for attempt in range(4):
+    for attempt in range(2):
         errors = validate_listing(listing)
 
         claim_problems = has_unsupported_claims(
@@ -1487,7 +1477,7 @@ async def create_draft_listing(
         if not errors and not claim_problems and originality["passed"]:
             break
 
-        if attempt == 3:
+        if attempt == 1:
             return {
                 "status": "blocked_before_etsy",
                 "message": (
@@ -1519,6 +1509,8 @@ async def create_draft_listing(
             "listing": listing,
             "validation_errors": errors,
         }
+
+    time_guard("pre-draft validation")
 
     # ---------------------------------------------------------------
     # CREATE DRAFT
@@ -1622,7 +1614,7 @@ async def create_draft_listing(
                     image.content_type or "image/jpeg",
                 )
             },
-            timeout=60,
+            timeout=15,
         )
 
         image_upload = {
