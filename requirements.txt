@@ -4,3 +4,4 @@ openai
 requests
 python-dotenv
 python-multipart
+redis
