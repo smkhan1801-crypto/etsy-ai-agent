@@ -8,12 +8,12 @@ import urllib.parse
 import json
 import re
 from difflib import SequenceMatcher
-from collections import Counter
+from collections import Counter, defaultdict
 
 import requests
 import redis
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from openai import OpenAI
 
@@ -1795,7 +1795,7 @@ Return ONLY valid JSON:
 
 
 @app.get("/optimizer", response_class=HTMLResponse)
-def optimizer_page():
+def optimizer_page(listing_id: str = Query("")):
     """Human-friendly UI for the existing Etsy listing SEO optimizer.
 
     This page only calls /analyze-existing-listing. It never writes to Etsy.
@@ -1866,6 +1866,7 @@ def optimizer_page():
     <form id="form">
       <label for="listing_url">Etsy listing URL</label>
       <input id="listing_url" name="listing_url" type="url" placeholder="https://www.etsy.com/listing/123456789/..." required>
+      <input id="listing_id_hint" type="hidden" value="" />
       <button id="run" type="submit">Analyze Listing</button>
       <div id="status" class="status"></div>
     </form>
@@ -1961,6 +1962,8 @@ def optimizer_page():
 </div>
 <script>
 const $ = id => document.getElementById(id);
+const queryListingId = new URLSearchParams(location.search).get('listing_id') || '';
+if(queryListingId) $('listing_id_hint').value=queryListingId;
 let latest = { title:'', tags:[], description:'' };
 function listInto(el, items) { el.innerHTML=''; (items||[]).forEach(x=>{const li=document.createElement('li');li.textContent=x;el.appendChild(li);}); }
 function render(data) {
@@ -1985,7 +1988,7 @@ function render(data) {
   renderPills('primaryKeywords',ki.primary_keywords); renderPills('secondaryKeywords',ki.secondary_keywords); renderPills('longTailKeywords',ki.long_tail_keywords); renderPills('buyerIntentKeywords',ki.buyer_intent_keywords); renderPills('avoidKeywords',ki.avoid_keywords);
   $('result').classList.remove('hidden');
 }
-$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
+$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());if($('listing_id_hint').value)fd.append('listing_id',$('listing_id_hint').value);const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
 document.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{const key=btn.dataset.copy;const value=key==='tags'?latest.tags.join(', '):latest[key];try{await navigator.clipboard.writeText(value||'');const old=btn.textContent;btn.textContent='Copied ✓';setTimeout(()=>btn.textContent=old,1200);}catch(_){btn.textContent='Copy failed';}}));
 $('copyAll').addEventListener('click',async()=>{const text=`TITLE\n${latest.title}\n\n13 TAGS\n${latest.tags.map((x,i)=>`${i+1}. ${x}`).join('\n')}\n\nDESCRIPTION\n${latest.description}`;try{await navigator.clipboard.writeText(text);const b=$('copyAll');b.textContent='Copied ✓';setTimeout(()=>b.textContent='📋 Copy All SEO Content',1400);}catch(_){$('copyAll').textContent='Copy failed';}});
 </script>
@@ -2098,6 +2101,144 @@ async def analyze_existing_listing(
         "validation_errors": validation_errors,
         "write_action_performed": False,
     }
+
+
+# -------------------------------------------------------------------
+# SHOP SEO PRIORITY AUDIT
+# -------------------------------------------------------------------
+
+def listing_priority_score(listing):
+    """Prioritize listings for human review; not an Etsy ranking score."""
+    title = str(listing.get("title", "") or "")
+    tags = listing.get("tags", []) or []
+    description = str(listing.get("description", "") or "")
+
+    issues = []
+    title_words = words(title)
+    if not title:
+        issues.append("missing title")
+    if len(title) > 140:
+        issues.append("title over 140 chars")
+    if len(title_words) > 15:
+        issues.append("title over 15 words")
+    if len(title_words) != len(set(title_words)) and title_words:
+        issues.append("repeated title words")
+    if not isinstance(tags, list) or len(tags) != 13:
+        issues.append("not 13 tags")
+    if isinstance(tags, list):
+        long_tags = sum(1 for t in tags if len(str(t).strip()) > 20)
+        if long_tags:
+            issues.append(f"{long_tags} tag(s) over 20 chars")
+        if len({str(t).strip().lower() for t in tags if str(t).strip()}) < len([t for t in tags if str(t).strip()]):
+            issues.append("duplicate tags")
+    if not description:
+        issues.append("missing description")
+    elif len(description.strip()) < 80:
+        issues.append("short description")
+
+    base = len(issues) * 15
+    favorites = int(listing.get("num_favorers") or 0)
+    views = int(listing.get("views") or 0)
+    engagement_bonus = min(20, round((favorites ** 0.5) * 2 + (views ** 0.5) * 0.25))
+    priority = min(100, base + engagement_bonus)
+    return priority, issues
+
+
+@app.get("/shop-seo-audit")
+async def shop_seo_audit(limit: int = 25, offset: int = 0):
+    """Read active shop listings and rank which ones deserve SEO review first.
+
+    This is a read-only triage report. It does not call the AI for every listing
+    and it does not edit Etsy. The user can then open any listing in the existing
+    optimizer for the full competitor/keyword analysis.
+    """
+    limit = max(5, min(int(limit), 50))
+    offset = max(0, int(offset))
+
+    context = get_shop_context()
+    access_token = context["access_token"]
+    shop_id = context["shop_id"]
+
+    url = f"https://api.etsy.com/v3/application/shops/{shop_id}/listings"
+    response = etsy_get(
+        url,
+        access_token,
+        params={"state": "active", "limit": limit, "offset": offset},
+    )
+    if not response.ok:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+
+    payload = response.json()
+    raw_listings = payload.get("results", []) or []
+    rows = []
+
+    for item in raw_listings:
+        priority, issues = listing_priority_score(item)
+        title = item.get("title", "") or ""
+        tags = item.get("tags", []) or []
+        description = item.get("description", "") or ""
+        rows.append({
+            "listing_id": item.get("listing_id"),
+            "title": title,
+            "url": item.get("url", ""),
+            "state": item.get("state", "active"),
+            "priority_score": priority,
+            "priority_level": "HIGH" if priority >= 45 else "MEDIUM" if priority >= 20 else "LOW",
+            "issues": issues,
+            "tag_count": len(tags) if isinstance(tags, list) else 0,
+            "title_chars": len(title),
+            "title_words": len(words(title)),
+            "description_chars": len(description),
+            "num_favorers": item.get("num_favorers", 0),
+            "views": item.get("views", 0),
+        })
+
+    rows.sort(key=lambda x: (x["priority_score"], x.get("num_favorers", 0), x.get("views", 0)), reverse=True)
+
+    return {
+        "status": "success",
+        "message": "Read-only shop SEO priority audit. No Etsy listing was changed.",
+        "shop_id": shop_id,
+        "count_returned": len(rows),
+        "total_available": payload.get("count"),
+        "offset": offset,
+        "limit": limit,
+        "next_offset": offset + limit if payload.get("count") is not None and offset + limit < int(payload.get("count") or 0) else None,
+        "method_note": "Priority score is a triage score based on listing-structure issues and capped engagement signals. It is not Etsy's ranking score.",
+        "listings": rows,
+    }
+
+
+@app.get("/shop-audit", response_class=HTMLResponse)
+def shop_audit_page():
+    return HTMLResponse(r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Etsy Shop SEO Audit</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b1020;color:#edf2ff;font-family:Inter,system-ui,sans-serif}.wrap{max-width:1180px;margin:auto;padding:30px 18px 60px}h1{margin:0 0 8px;font-size:31px}.sub{color:#aab6d3;line-height:1.55}.card{background:#121a2e;border:1px solid #263454;border-radius:16px;padding:18px;margin-top:18px}.toolbar{display:flex;gap:10px;align-items:end;flex-wrap:wrap}.field{flex:1;min-width:180px}.field label{display:block;font-size:13px;font-weight:800;margin-bottom:7px}.field input{width:100%;padding:11px;border-radius:9px;border:1px solid #344463;background:#0c1325;color:#fff}.btn{border:0;border-radius:9px;padding:11px 16px;font-weight:800;background:#7189ff;color:#071022;cursor:pointer}.status{margin-top:12px;color:#aab6d3}.error{color:#ff9c9c}.success{color:#87e0ad}.table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:900px}.table th,.table td{text-align:left;padding:12px 10px;border-bottom:1px solid #263454;vertical-align:top}.table th{color:#8f9fbe;font-size:12px}.title{font-weight:750;max-width:360px}.badge{display:inline-block;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:850}.high{background:#4a2732;color:#ffb2bd}.medium{background:#493d22;color:#ffd889}.low{background:#1e3a31;color:#9de7bf}.issues{color:#aab6d3;font-size:12px;line-height:1.5}.link{color:#aebcff;text-decoration:none}.muted{color:#8f9fbe;font-size:12px}.empty{padding:24px;text-align:center;color:#aab6d3}
+</style>
+</head><body><div class="wrap">
+<h1>📊 Etsy Shop SEO Priority Audit</h1>
+<p class="sub">Find which active listings deserve SEO attention first. This report is read-only; it never edits or publishes anything.</p>
+<div class="card"><div class="toolbar"><div class="field"><label>Listings to scan</label><input id="limit" type="number" min="5" max="50" value="25"></div><div class="field"><label>Offset</label><input id="offset" type="number" min="0" value="0"></div><button class="btn" id="run">Scan Shop</button></div><div id="status" class="status"></div></div>
+<div class="card"><div id="summary" class="muted"></div><div class="table-wrap"><table class="table"><thead><tr><th>Priority</th><th>Listing</th><th>Issues</th><th>Title</th><th>Tags</th><th>Favorites</th><th>Action</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+</div><script>
+const $=id=>document.getElementById(id);
+function esc(v){const d=document.createElement('div');d.textContent=v??'';return d.innerHTML}
+async function scan(){
+ $('run').disabled=true;$('status').className='status';$('status').textContent='Reading active Etsy listings…';$('rows').innerHTML='';
+ try{const r=await fetch(`/shop-seo-audit?limit=${encodeURIComponent($('limit').value)}&offset=${encodeURIComponent($('offset').value)}`);const raw=await r.text();let d;try{d=JSON.parse(raw)}catch(e){throw Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`)}if(!r.ok)throw Error(d.detail||`Audit failed (HTTP ${r.status})`);
+ $('status').className='status success';$('status').textContent='Scan complete — no Etsy listing was changed.';$('summary').textContent=`Showing ${d.count_returned} listings${d.total_available!=null?' of '+d.total_available:''}. Highest priority appears first.`;
+ (d.listings||[]).forEach(x=>{const tr=document.createElement('tr');const level=(x.priority_level||'LOW').toLowerCase();const url=x.url||'';const issues=(x.issues||[]).join(' • ')||'No obvious structure issue';tr.innerHTML=`<td><span class="badge ${level}">${esc(x.priority_level)}</span><br><b>${esc(x.priority_score)}</b>/100</td><td class="title">${esc(x.title)}</td><td class="issues">${esc(issues)}</td><td>${esc(x.title_chars)} chars<br>${esc(x.title_words)} words</td><td>${esc(x.tag_count)}/13</td><td>${esc(x.num_favorers??0)}</td><td><a class="link" href="/optimizer?listing_id=${encodeURIComponent(x.listing_id||'')}" target="_blank">Open optimizer →</a>${url?`<br><a class="link" href="${esc(url)}" target="_blank">View Etsy →</a>`:''}</td>`;$('rows').appendChild(tr)});
+ if(!(d.listings||[]).length)$('rows').innerHTML='<tr><td colspan="7" class="empty">No active listings returned.</td></tr>';
+ }catch(e){$('status').className='status error';$('status').textContent=e.message||'Something went wrong.'}finally{$('run').disabled=false}
+}
+$('run').addEventListener('click',scan);scan();
+</script></body></html>
+""")
 
 
 # -------------------------------------------------------------------
