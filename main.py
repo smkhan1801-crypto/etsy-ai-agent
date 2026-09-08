@@ -14,7 +14,7 @@ import requests
 import redis
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, HTMLResponse
 from openai import OpenAI
 
 app = FastAPI()
@@ -65,7 +65,9 @@ def home():
     return {
         "status": "running",
         "agent": "Etsy AI Listing Agent",
-        "mode": "draft_only",
+        "mode": "existing_listing_seo_optimizer",
+        "optimizer_ui": "/optimizer",
+        "docs": "/docs",
     }
 
 
@@ -1620,6 +1622,134 @@ Return ONLY valid JSON:
 
     return parse_listing_json(response.output_text)
 
+
+@app.get("/optimizer", response_class=HTMLResponse)
+def optimizer_page():
+    """Human-friendly UI for the existing Etsy listing SEO optimizer.
+
+    This page only calls /analyze-existing-listing. It never writes to Etsy.
+    """
+    return HTMLResponse(r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Etsy AI SEO Optimizer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif; background:#0b1020; color:#edf2ff; }
+  .wrap { max-width:1100px; margin:0 auto; padding:32px 18px 60px; }
+  .hero { margin-bottom:22px; }
+  h1 { margin:0 0 8px; font-size:32px; }
+  .sub { color:#aab6d3; margin:0; line-height:1.55; }
+  .card { background:#121a2e; border:1px solid #263454; border-radius:16px; padding:20px; margin-top:18px; box-shadow:0 10px 30px rgba(0,0,0,.18); }
+  label { display:block; font-size:14px; font-weight:700; margin-bottom:8px; }
+  input { width:100%; padding:13px 14px; border-radius:10px; border:1px solid #344463; background:#0c1325; color:#fff; outline:none; }
+  input:focus { border-color:#7189ff; }
+  button { margin-top:14px; border:0; border-radius:10px; padding:12px 18px; font-weight:800; cursor:pointer; background:#7189ff; color:#071022; }
+  button:disabled { opacity:.55; cursor:not-allowed; }
+  .status { margin-top:12px; color:#aab6d3; min-height:22px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  .full { grid-column:1 / -1; }
+  .section-title { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px; }
+  h2 { font-size:19px; margin:0; }
+  .copy { margin:0; padding:7px 10px; font-size:12px; border:1px solid #3b4a6c; background:#18233d; color:#dce5ff; }
+  .title-box, .description { white-space:pre-wrap; line-height:1.6; background:#0b1223; border:1px solid #293957; border-radius:10px; padding:14px; }
+  .title-box { font-size:18px; font-weight:750; }
+  .description { min-height:170px; }
+  ol, ul { margin:0; padding-left:22px; line-height:1.7; }
+  .tags { display:flex; flex-wrap:wrap; gap:8px; }
+  .tag { background:#1a2744; border:1px solid #34486f; border-radius:999px; padding:7px 10px; font-size:13px; }
+  .muted { color:#9eabc8; font-size:13px; }
+  .success { color:#87e0ad; }
+  .warn { color:#ffd27a; }
+  .error { color:#ff9c9c; }
+  .meta { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .meta div { background:#0b1223; border:1px solid #293957; border-radius:10px; padding:12px; }
+  .meta strong { display:block; font-size:12px; color:#8f9fbe; margin-bottom:4px; }
+  .keyword { padding:10px 0; border-bottom:1px solid #263454; }
+  .keyword:last-child { border-bottom:0; }
+  .keyword b { font-size:14px; }
+  .keyword span { display:block; color:#aab6d3; font-size:13px; margin-top:3px; }
+  .hidden { display:none; }
+  @media(max-width:760px) { .grid { grid-template-columns:1fr; } .full { grid-column:auto; } .meta { grid-template-columns:1fr; } h1 { font-size:27px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>🚀 Etsy AI SEO Optimizer</h1>
+    <p class="sub">Analyze an existing Etsy listing and get a buyer-friendly title, 13 SEO tags, optimized description and keyword strategy. <b>Nothing is edited or published.</b></p>
+  </div>
+  <div class="card">
+    <form id="form">
+      <label for="listing_url">Etsy listing URL</label>
+      <input id="listing_url" name="listing_url" type="url" placeholder="https://www.etsy.com/listing/123456789/..." required>
+      <button id="run" type="submit">Analyze Listing</button>
+      <div id="status" class="status"></div>
+    </form>
+  </div>
+  <div id="result" class="hidden">
+    <div class="card">
+      <div class="section-title"><h2>🏷️ Recommended SEO Title</h2><button type="button" class="copy" data-copy="title">Copy</button></div>
+      <div id="title" class="title-box"></div><p id="titleCount" class="muted"></p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="section-title"><h2>🔖 13 Etsy Tags</h2><button type="button" class="copy" data-copy="tags">Copy</button></div>
+        <div id="tags" class="tags"></div><p class="muted">Each tag is checked against the 20-character limit.</p>
+      </div>
+      <div class="card">
+        <div class="section-title"><h2>📝 Optimized Description</h2><button type="button" class="copy" data-copy="description">Copy</button></div>
+        <div id="description" class="description"></div>
+      </div>
+      <div class="card">
+        <div class="section-title"><h2>📊 Current Listing Analysis</h2></div>
+        <div><b>Strengths</b><ul id="strengths"></ul></div><br>
+        <div><b>Weaknesses</b><ul id="weaknesses"></ul></div><br>
+        <div><b>SEO Opportunities</b><ul id="opportunities"></ul></div>
+      </div>
+      <div class="card">
+        <div class="section-title"><h2>🔍 Keyword Strategy</h2></div><div id="keywords"></div>
+      </div>
+      <div class="card full">
+        <div class="section-title"><h2>🔄 What Changed</h2></div><ul id="changes"></ul><p id="volumeNote" class="muted"></p>
+      </div>
+      <div class="card full">
+        <div class="section-title"><h2>📌 Current Listing</h2></div>
+        <div class="meta">
+          <div><strong>CURRENT TITLE</strong><span id="currentTitle"></span></div>
+          <div><strong>LISTING ID</strong><span id="listingId"></span></div>
+          <div><strong>WRITE ACTION</strong><span class="success">Not performed</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let latest = { title:'', tags:[], description:'' };
+function listInto(el, items) { el.innerHTML=''; (items||[]).forEach(x=>{const li=document.createElement('li');li.textContent=x;el.appendChild(li);}); }
+function render(data) {
+  const o=data.optimized_result||{}, a=o.current_listing_analysis||{};
+  latest={title:o.recommended_title||'',tags:o.recommended_tags||[],description:o.recommended_description||''};
+  $('title').textContent=latest.title;
+  $('titleCount').textContent=`${latest.title.length} characters • ${latest.title.trim()?latest.title.trim().split(/\s+/).length:0} words`;
+  $('tags').innerHTML=''; latest.tags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('tags').appendChild(s);});
+  $('description').textContent=latest.description;
+  listInto($('strengths'),a.strengths); listInto($('weaknesses'),a.weaknesses); listInto($('opportunities'),a.seo_opportunities); listInto($('changes'),o.changes_summary);
+  $('volumeNote').textContent=o.search_volume_note||''; $('currentTitle').textContent=data.current_listing?.title||''; $('listingId').textContent=data.listing_id||'';
+  $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(sp);$('keywords').appendChild(d);});
+  $('result').classList.remove('hidden');
+}
+$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.detail||'Analysis failed');if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
+document.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{const key=btn.dataset.copy;const value=key==='tags'?latest.tags.join(', '):latest[key];try{await navigator.clipboard.writeText(value||'');const old=btn.textContent;btn.textContent='Copied ✓';setTimeout(()=>btn.textContent=old,1200);}catch(_){btn.textContent='Copy failed';}}));
+</script>
+</body>
+</html>
+""")
 
 @app.post("/analyze-existing-listing")
 async def analyze_existing_listing(
