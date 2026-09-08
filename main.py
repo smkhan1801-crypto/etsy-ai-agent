@@ -1692,6 +1692,12 @@ INTERPRETATION:
 - Prefer phrases that accurately match this listing over merely frequent generic phrases.
 - Do not blindly copy competitor tags or titles; use them only as market-language evidence.
 - Build a balanced tag set across core product, gemstone, material, style/use, occasion, and buyer-intent phrases where truthful.
+- Classify keyword opportunities into primary, secondary, long-tail, buyer-intent, and avoid groups.
+- Primary keywords should describe the core product and strongest relevant search intent.
+- Secondary keywords should support material, gemstone, style, or use-case relevance.
+- Long-tail keywords should be specific multi-word phrases a buyer could realistically search.
+- Buyer-intent keywords should reflect gifting or purchase intent only when appropriate.
+- Avoid keywords that are irrelevant, unsupported by the listing, misleading, overly generic, or likely to create false expectations.
 
 GOAL:
 Create a significantly better, buyer-focused Etsy title and 13 tags based on
@@ -1742,8 +1748,15 @@ Return ONLY valid JSON:
   "recommended_tags": ["exactly 13 tags"],
   "recommended_description": "...",
   "keyword_strategy": [
-    {{"keyword": "...", "reason": "..."}}
+    {{"keyword": "...", "type": "primary", "signal": "strong", "reason": "..."}}
   ],
+  "keyword_intelligence": {{
+    "primary_keywords": ["..."],
+    "secondary_keywords": ["..."],
+    "long_tail_keywords": ["..."],
+    "buyer_intent_keywords": ["..."],
+    "avoid_keywords": ["..."]
+  }},
   "changes_summary": ["..."],
   "search_volume_note": "Exact Etsy search volume is not available through the API; these are marketplace ranking/frequency signals."
 }}
@@ -1807,6 +1820,10 @@ def optimizer_page():
   .keyword:last-child { border-bottom:0; }
   .keyword b { font-size:14px; }
   .keyword span { display:block; color:#aab6d3; font-size:13px; margin-top:3px; }
+  .keyword span:nth-child(2) { color:#7f92ba; font-size:11px; font-weight:800; letter-spacing:.4px; }
+  .pill-group { margin-top:14px; }
+  .pill-group h3 { margin:0 0 8px; font-size:13px; color:#aebbd8; }
+  .pill-wrap { display:flex; flex-wrap:wrap; gap:8px; }
   .score-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
   .score-box { background:#0b1223; border:1px solid #293957; border-radius:10px; padding:14px; text-align:center; }
   .score-box strong { display:block; color:#8f9fbe; font-size:11px; margin-bottom:6px; }
@@ -1851,6 +1868,15 @@ def optimizer_page():
       </div>
       <div class="card">
         <div class="section-title"><h2>🔍 Keyword Strategy</h2></div><div id="keywords"></div>
+      </div>
+      <div class="card full">
+        <div class="section-title"><h2>🧠 Advanced Keyword Intelligence</h2></div>
+        <div class="pill-group"><h3>🥇 Primary Keywords</h3><div id="primaryKeywords" class="pill-wrap"></div></div>
+        <div class="pill-group"><h3>🥈 Secondary Keywords</h3><div id="secondaryKeywords" class="pill-wrap"></div></div>
+        <div class="pill-group"><h3>🎯 Long-Tail Keywords</h3><div id="longTailKeywords" class="pill-wrap"></div></div>
+        <div class="pill-group"><h3>🛍️ Buyer-Intent Keywords</h3><div id="buyerIntentKeywords" class="pill-wrap"></div></div>
+        <div class="pill-group"><h3>🚫 Avoid Keywords</h3><div id="avoidKeywords" class="pill-wrap"></div></div>
+        <p class="muted">Keyword groups are AI recommendations based on the listing facts and marketplace signals. They are not exact Etsy search-volume data.</p>
       </div>
       <div class="card full">
         <div class="section-title"><h2>🔄 What Changed</h2></div><ul id="changes"></ul><p id="volumeNote" class="muted"></p>
@@ -1905,7 +1931,10 @@ function render(data) {
   const bd=sc.breakdown||{};
   const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; $(el).textContent=(val ?? '—'); $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
   setBreak('title','titleBreak','titleBar'); setBreak('tags','tagsBreak','tagsBar'); setBreak('description','descBreak','descBar');
-  $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(sp);$('keywords').appendChild(d);});
+  $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const meta=document.createElement('span');meta.textContent=`${(item.type||'keyword').toUpperCase()} • ${(item.signal||'signal').toUpperCase()}`;const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(meta);d.appendChild(sp);$('keywords').appendChild(d);});
+  const ki=o.keyword_intelligence||{};
+  const renderPills=(id,items)=>{const el=$(id);el.innerHTML='';(items||[]).forEach(x=>{const s=document.createElement('span');s.className='tag';s.textContent=x;el.appendChild(s);});};
+  renderPills('primaryKeywords',ki.primary_keywords); renderPills('secondaryKeywords',ki.secondary_keywords); renderPills('longTailKeywords',ki.long_tail_keywords); renderPills('buyerIntentKeywords',ki.buyer_intent_keywords); renderPills('avoidKeywords',ki.avoid_keywords);
   $('result').classList.remove('hidden');
 }
 $('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const data=await r.json();if(!r.ok)throw new Error(data.detail||'Analysis failed');if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
