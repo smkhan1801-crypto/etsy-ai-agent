@@ -1170,12 +1170,30 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
 
     signals = market_signals.get('high_signal_phrases', []) if isinstance(market_signals, dict) else []
     signal_count = len(signals)
+    improvement = optimized_score - current_score
     return {
         'current_score': current_score,
         'optimized_score': optimized_score,
-        'improvement': optimized_score - current_score,
+        'improvement': improvement,
         'grade': 'A' if optimized_score >= 90 else 'B' if optimized_score >= 80 else 'C' if optimized_score >= 70 else 'D' if optimized_score >= 60 else 'E',
         'market_signal_count': signal_count,
+        'breakdown': {
+            'title': {
+                'current': score_title(current_title),
+                'optimized': score_title(optimized_title),
+                'max': 70,
+            },
+            'tags': {
+                'current': score_tags(current_tags),
+                'optimized': score_tags(optimized_tags),
+                'max': 20,
+            },
+            'description': {
+                'current': score_description(current_description),
+                'optimized': score_description(optimized_description),
+                'max': 10,
+            },
+        },
         'note': 'Directional optimization score for structure, relevance and marketplace-signal usage. It is not an Etsy ranking prediction.'
     }
 
@@ -1848,6 +1866,18 @@ def optimizer_page():
         <p id="scoreNote" class="muted"></p>
       </div>
       <div class="card full">
+        <div class="section-title"><h2>🧠 SEO Intelligence Breakdown</h2></div>
+        <div class="breakdown">
+          <div class="break-row"><span>Title</span><b id="titleBreak">—</b><small>/ 70</small></div>
+          <div class="bar"><i id="titleBar"></i></div>
+          <div class="break-row"><span>13 Tags</span><b id="tagsBreak">—</b><small>/ 20</small></div>
+          <div class="bar"><i id="tagsBar"></i></div>
+          <div class="break-row"><span>Description</span><b id="descBreak">—</b><small>/ 10</small></div>
+          <div class="bar"><i id="descBar"></i></div>
+        </div>
+        <p class="muted">The breakdown shows how the optimizer scores listing structure. It is not Etsy's internal ranking formula.</p>
+      </div>
+      <div class="card full">
         <div class="section-title"><h2>📌 Current Listing</h2></div>
         <div class="meta">
           <div><strong>CURRENT TITLE</strong><span id="currentTitle"></span></div>
@@ -1872,6 +1902,9 @@ function render(data) {
   listInto($('strengths'),a.strengths); listInto($('weaknesses'),a.weaknesses); listInto($('opportunities'),a.seo_opportunities); listInto($('changes'),o.changes_summary);
   $('volumeNote').textContent=o.search_volume_note||''; $('currentTitle').textContent=data.current_listing?.title||''; $('listingId').textContent=data.listing_id||'';
   const sc=data.seo_score||{}; $('currentScore').textContent=(sc.current_score ?? '—')+'/100'; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('improvement').textContent=(sc.improvement>=0?'+':'')+(sc.improvement ?? '—'); $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
+  const bd=sc.breakdown||{};
+  const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; $(el).textContent=(val ?? '—'); $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
+  setBreak('title','titleBreak','titleBar'); setBreak('tags','tagsBreak','tagsBar'); setBreak('description','descBreak','descBar');
   $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(sp);$('keywords').appendChild(d);});
   $('result').classList.remove('hidden');
 }
