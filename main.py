@@ -5,11 +5,15 @@ import hashlib
 import hmac
 import time
 import urllib.parse
+import json
+
 import requests
+import redis
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from openai import OpenAI
+
 
 app = FastAPI()
 
@@ -20,6 +24,18 @@ ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET")
 
 ETSY_REDIRECT_URI = "https://etsy-ai-agent.onrender.com/etsy/callback"
 
+REDIS_URL = os.getenv("REDIS_URL")
+
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL environment variable is missing.")
+
+redis_client = redis.Redis.from_url(
+    REDIS_URL,
+    decode_responses=True
+)
+
+TOKEN_KEY = "etsy:oauth_token"
+
 
 @app.get("/")
 def home():
@@ -28,6 +44,121 @@ def home():
         "agent": "Etsy AI Listing Agent"
     }
 
+
+# ---------------------------------------------------------
+# REDIS
+# ---------------------------------------------------------
+
+def save_etsy_token(token_data):
+    redis_client.set(
+        TOKEN_KEY,
+        json.dumps(token_data)
+    )
+
+
+def get_etsy_token():
+    data = redis_client.get(TOKEN_KEY)
+
+    if not data:
+        return None
+
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------
+# ETSY TOKEN REFRESH
+# ---------------------------------------------------------
+
+def refresh_etsy_token():
+    token_data = get_etsy_token()
+
+    if not token_data:
+        return None
+
+    refresh_token = token_data.get("refresh_token")
+
+    if not refresh_token:
+        return None
+
+    response = requests.post(
+        "https://api.etsy.com/v3/public/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": ETSY_KEYSTRING,
+            "refresh_token": refresh_token,
+        },
+        timeout=30,
+    )
+
+    if not response.ok:
+        return None
+
+    new_token = response.json()
+
+    save_etsy_token(new_token)
+
+    return new_token
+
+
+def get_valid_etsy_token():
+    token_data = get_etsy_token()
+
+    if not token_data:
+        return None
+
+    expires_at = token_data.get("expires_at")
+
+    if expires_at:
+        # Refresh slightly before expiry
+        if int(time.time()) >= int(expires_at) - 120:
+            refreshed = refresh_etsy_token()
+
+            if refreshed:
+                token_data = refreshed
+
+    return token_data
+
+
+# ---------------------------------------------------------
+# ETSY API
+# ---------------------------------------------------------
+
+def etsy_headers(access_token):
+    return {
+        "x-api-key": f"{ETSY_KEYSTRING}:{ETSY_SHARED_SECRET}",
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+
+def etsy_get(url, access_token):
+    response = requests.get(
+        url,
+        headers=etsy_headers(access_token),
+        timeout=30,
+    )
+
+    if response.status_code == 401:
+        refreshed = refresh_etsy_token()
+
+        if refreshed:
+            access_token = refreshed.get("access_token")
+
+            response = requests.get(
+                url,
+                headers=etsy_headers(access_token),
+                timeout=30,
+            )
+
+    return response
+
+
+# ---------------------------------------------------------
+# OAUTH SECURITY
+# ---------------------------------------------------------
 
 def create_oauth_signature(state, code_verifier, timestamp):
     message = f"{state}|{code_verifier}|{timestamp}".encode("utf-8")
@@ -39,8 +170,13 @@ def create_oauth_signature(state, code_verifier, timestamp):
     ).hexdigest()
 
 
+# ---------------------------------------------------------
+# ETSY CONNECT
+# ---------------------------------------------------------
+
 @app.get("/etsy/connect")
 def etsy_connect():
+
     if not ETSY_KEYSTRING or not ETSY_SHARED_SECRET:
         raise HTTPException(
             status_code=500,
@@ -84,7 +220,9 @@ def etsy_connect():
         + urllib.parse.urlencode(params)
     )
 
-    response = RedirectResponse(url=etsy_url)
+    response = RedirectResponse(
+        url=etsy_url
+    )
 
     response.set_cookie(
         key="etsy_oauth",
@@ -98,6 +236,10 @@ def etsy_connect():
     return response
 
 
+# ---------------------------------------------------------
+# OAUTH CALLBACK
+# ---------------------------------------------------------
+
 @app.get("/etsy/callback")
 def etsy_callback(
     request: Request,
@@ -106,6 +248,7 @@ def etsy_callback(
     error: str = None,
     error_description: str = None,
 ):
+
     if error:
         return {
             "status": "etsy_authorization_failed",
@@ -131,6 +274,7 @@ def etsy_callback(
         cookie_state, code_verifier, timestamp, signature = (
             oauth_cookie.split("|", 3)
         )
+
     except ValueError:
         raise HTTPException(
             status_code=400,
@@ -143,24 +287,39 @@ def etsy_callback(
         timestamp
     )
 
-    if not hmac.compare_digest(signature, expected_signature):
+    if not hmac.compare_digest(
+        signature,
+        expected_signature
+    ):
         raise HTTPException(
             status_code=400,
             detail="Invalid OAuth session signature."
         )
 
-    if not hmac.compare_digest(cookie_state, state):
+    if not hmac.compare_digest(
+        cookie_state,
+        state
+    ):
         raise HTTPException(
             status_code=400,
             detail="OAuth state mismatch."
         )
 
-    if int(time.time()) - int(timestamp) > 600:
+    try:
+        timestamp_int = int(timestamp)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid OAuth timestamp."
+        )
+
+    if int(time.time()) - timestamp_int > 600:
         raise HTTPException(
             status_code=400,
             detail="OAuth session expired. Please start again."
         )
 
+    # Exchange authorization code for Etsy token
     token_response = requests.post(
         "https://api.etsy.com/v3/public/oauth/token",
         data={
@@ -189,10 +348,26 @@ def etsy_callback(
             detail="Etsy did not return an access token."
         )
 
+    # Etsy access tokens expire.
+    # Store an approximate expiration timestamp.
+    expires_in = int(
+        token_data.get(
+            "expires_in",
+            3600
+        )
+    )
+
+    token_data["expires_at"] = int(
+        time.time()
+    ) + expires_in
+
+    # SAVE TOKEN TO REDIS
+    save_etsy_token(token_data)
+
     user_id = access_token.split(".")[0]
 
     response = RedirectResponse(
-        url="/etsy/status?connected=1"
+        url="/etsy/status"
     )
 
     response.delete_cookie(
@@ -204,26 +379,75 @@ def etsy_callback(
     return response
 
 
+# ---------------------------------------------------------
+# ETSY STATUS
+# ---------------------------------------------------------
+
 @app.get("/etsy/status")
-def etsy_status(connected: int = 0):
-    if connected == 1:
+def etsy_status():
+
+    token_data = get_valid_etsy_token()
+
+    if not token_data:
         return {
-            "connected": True,
-            "message": "Etsy authorization completed successfully."
+            "connected": False,
+            "message": "Etsy account is not connected."
         }
 
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        return {
+            "connected": False,
+            "message": "Etsy access token is missing."
+        }
+
+    user_id = access_token.split(".")[0]
+
+    # Try to retrieve the seller's shop
+    shops_url = (
+        f"https://api.etsy.com/v3/application/users/"
+        f"{user_id}/shops"
+    )
+
+    shop_response = etsy_get(
+        shops_url,
+        access_token
+    )
+
+    if not shop_response.ok:
+
+        return {
+            "connected": True,
+            "shop_loaded": False,
+            "message": "Etsy authorization is stored, but shop information could not be loaded.",
+            "etsy_status_code": shop_response.status_code,
+        }
+
+    shop_data = shop_response.json()
+
     return {
-        "connected": False,
-        "message": "Etsy account is not connected yet."
+        "connected": True,
+        "shop_loaded": True,
+        "message": "Etsy account connected successfully.",
+        "shop": shop_data,
     }
 
+
+# ---------------------------------------------------------
+# PHOTO LISTING GENERATOR
+# ---------------------------------------------------------
 
 @app.post("/generate-listing-photo")
 async def generate_listing_photo(
     image: UploadFile = File(...),
     extra_info: str = Form("")
 ):
-    if not image.content_type or not image.content_type.startswith("image/"):
+
+    if (
+        not image.content_type
+        or not image.content_type.startswith("image/")
+    ):
         raise HTTPException(
             status_code=400,
             detail="Please upload an image file."
@@ -237,28 +461,41 @@ async def generate_listing_photo(
             detail="Image is too large. Please use an image under 10 MB."
         )
 
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_base64 = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
 
     image_data_url = (
         f"data:{image.content_type};base64,{image_base64}"
     )
 
     prompt = f"""
-You are an expert Etsy SEO listing agent specializing in handmade
-gemstone jewelry.
+You are an expert Etsy SEO listing agent specializing in
+handmade gemstone jewelry.
 
 Analyze the uploaded product photograph carefully.
 
 Identify ONLY what can reasonably be observed from the image.
-Do NOT invent gemstone identity, natural/genuine status, origin,
-treatment, certification, metal purity, or measurements.
+
+Do NOT invent:
+- gemstone identity
+- natural/genuine status
+- gemstone origin
+- treatment
+- certification
+- metal purity
+- measurements
+- carat weight
+- authenticity
 
 Additional seller information:
+
 {extra_info}
 
 Create an Etsy-ready listing.
 
 Return:
+
 1. Product observations
 2. SEO title under 140 characters
 3. Exactly 13 Etsy tags, each 20 characters or fewer
@@ -269,11 +506,13 @@ Return:
 8. Claims that require seller verification
 
 Important:
-- Do not claim "natural", "genuine", "solid gold", "925", etc.
-  unless supplied by the seller or clearly verifiable.
+
+- Do not claim "natural", "genuine", "solid gold",
+  "925", etc. unless supplied by the seller or clearly verifiable.
 - Keep keywords natural.
 - Avoid keyword stuffing.
 - Make the listing suitable for handmade gemstone jewelry.
+- Make the title readable and buyer-focused.
 """
 
     response = client.responses.create(
@@ -293,6 +532,50 @@ Important:
                 ]
             }
         ]
+    )
+
+    return {
+        "status": "success",
+        "listing": response.output_text
+    }
+
+
+# ---------------------------------------------------------
+# SIMPLE TEXT LISTING GENERATOR
+# ---------------------------------------------------------
+
+@app.post("/generate-listing")
+async def generate_listing(
+    product: str = Form(...),
+    details: str = Form("")
+):
+
+    prompt = f"""
+Create a professional Etsy listing for this handmade jewelry product.
+
+Product:
+{product}
+
+Seller details:
+{details}
+
+Return:
+
+1. SEO title under 140 characters
+2. Exactly 13 Etsy tags
+3. Product description
+4. Materials
+5. Suggested attributes
+6. Gift keywords
+7. Claims requiring seller verification
+
+Never invent gemstone authenticity, natural status,
+metal purity, origin, treatment or measurements.
+"""
+
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        input=prompt
     )
 
     return {
