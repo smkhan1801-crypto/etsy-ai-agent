@@ -2,10 +2,12 @@ import os
 import base64
 import secrets
 import hashlib
+import hmac
+import time
 import urllib.parse
 import requests
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from openai import OpenAI
 
@@ -18,12 +20,6 @@ ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET")
 
 ETSY_REDIRECT_URI = "https://etsy-ai-agent.onrender.com/etsy/callback"
 
-# Temporary OAuth storage for the authorization process
-oauth_sessions = {}
-
-# Connected Etsy account token
-etsy_token = None
-
 
 @app.get("/")
 def home():
@@ -33,12 +29,22 @@ def home():
     }
 
 
+def create_oauth_signature(state, code_verifier, timestamp):
+    message = f"{state}|{code_verifier}|{timestamp}".encode("utf-8")
+
+    return hmac.new(
+        ETSY_SHARED_SECRET.encode("utf-8"),
+        message,
+        hashlib.sha256
+    ).hexdigest()
+
+
 @app.get("/etsy/connect")
 def etsy_connect():
-    if not ETSY_KEYSTRING:
+    if not ETSY_KEYSTRING or not ETSY_SHARED_SECRET:
         raise HTTPException(
             status_code=500,
-            detail="ETSY_API_KEYSTRING is not configured."
+            detail="Etsy API credentials are not configured."
         )
 
     state = secrets.token_urlsafe(32)
@@ -51,9 +57,17 @@ def etsy_connect():
         ).digest()
     ).decode("utf-8").rstrip("=")
 
-    oauth_sessions[state] = {
-        "code_verifier": code_verifier
-    }
+    timestamp = str(int(time.time()))
+
+    signature = create_oauth_signature(
+        state,
+        code_verifier,
+        timestamp
+    )
+
+    cookie_value = (
+        f"{state}|{code_verifier}|{timestamp}|{signature}"
+    )
 
     params = {
         "response_type": "code",
@@ -70,18 +84,28 @@ def etsy_connect():
         + urllib.parse.urlencode(params)
     )
 
-    return RedirectResponse(url=etsy_url)
+    response = RedirectResponse(url=etsy_url)
+
+    response.set_cookie(
+        key="etsy_oauth",
+        value=cookie_value,
+        max_age=600,
+        httponly=True,
+        secure=True,
+        samesite="lax"
+    )
+
+    return response
 
 
 @app.get("/etsy/callback")
 def etsy_callback(
+    request: Request,
     code: str = None,
     state: str = None,
     error: str = None,
     error_description: str = None,
 ):
-    global etsy_token
-
     if error:
         return {
             "status": "etsy_authorization_failed",
@@ -95,15 +119,47 @@ def etsy_callback(
             detail="Missing Etsy authorization code or state."
         )
 
-    session = oauth_sessions.pop(state, None)
+    oauth_cookie = request.cookies.get("etsy_oauth")
 
-    if not session:
+    if not oauth_cookie:
         raise HTTPException(
             status_code=400,
-            detail="Invalid or expired OAuth state."
+            detail="OAuth session cookie is missing. Please start again from /etsy/connect."
         )
 
-    code_verifier = session["code_verifier"]
+    try:
+        cookie_state, code_verifier, timestamp, signature = (
+            oauth_cookie.split("|", 3)
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid OAuth session."
+        )
+
+    expected_signature = create_oauth_signature(
+        cookie_state,
+        code_verifier,
+        timestamp
+    )
+
+    if not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid OAuth session signature."
+        )
+
+    if not hmac.compare_digest(cookie_state, state):
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth state mismatch."
+        )
+
+    if int(time.time()) - int(timestamp) > 600:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth session expired. Please start again."
+        )
 
     token_response = requests.post(
         "https://api.etsy.com/v3/public/oauth/token",
@@ -125,37 +181,40 @@ def etsy_callback(
 
     token_data = token_response.json()
 
-    etsy_token = token_data
-
     access_token = token_data.get("access_token")
+
+    if not access_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Etsy did not return an access token."
+        )
 
     user_id = access_token.split(".")[0]
 
-    return {
-        "status": "etsy_connected",
-        "message": "Etsy account connected successfully.",
-        "user_id": user_id,
-        "scope": token_data.get("scope"),
-        "next": "Etsy OAuth connection is working."
-    }
+    response = RedirectResponse(
+        url="/etsy/status?connected=1"
+    )
+
+    response.delete_cookie(
+        key="etsy_oauth",
+        secure=True,
+        samesite="lax"
+    )
+
+    return response
 
 
 @app.get("/etsy/status")
-def etsy_status():
-    if not etsy_token:
+def etsy_status(connected: int = 0):
+    if connected == 1:
         return {
-            "connected": False,
-            "message": "Etsy account is not connected."
+            "connected": True,
+            "message": "Etsy authorization completed successfully."
         }
 
-    access_token = etsy_token.get("access_token")
-
-    user_id = access_token.split(".")[0]
-
     return {
-        "connected": True,
-        "user_id": user_id,
-        "scope": etsy_token.get("scope"),
+        "connected": False,
+        "message": "Etsy account is not connected yet."
     }
 
 
