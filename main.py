@@ -1262,7 +1262,6 @@ Return a concise analysis covering:
     keyword_research = market_keyword_research(
         product_context + " " + extra_info
     )
-    time_guard("market keyword research")
 
     listing = generate_listing(
         product_context,
@@ -1326,8 +1325,6 @@ Return a concise analysis covering:
                 "draft_created": False,
                 "published": False,
             }
-
-        time_guard("originality rewrite")
 
         listing = rewrite_listing(
             listing,
@@ -1415,6 +1412,308 @@ async def check_originality(
             "This is a similarity screen, not a legal copyright guarantee. "
             "Common SEO words may overlap naturally."
         ),
+    }
+
+
+
+# -------------------------------------------------------------------
+# EXISTING ETSY LISTING SEO OPTIMIZER
+# -------------------------------------------------------------------
+
+def extract_listing_id(value):
+    """Accept either a numeric Etsy listing ID or an Etsy listing URL."""
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return value
+    match = re.search(r"/listing/(\d+)", value)
+    if match:
+        return match.group(1)
+    match = re.search(r"(?:listing_id|listingId)[=/](\d+)", value, flags=re.I)
+    if match:
+        return match.group(1)
+    return None
+
+
+def listing_market_queries(listing):
+    """Build a small set of buyer-language queries from an existing listing."""
+    stop = {
+        "handmade", "jewelry", "jewellery", "ring", "rings", "gift",
+        "gifts", "women", "woman", "men", "mens", "beautiful", "elegant",
+        "natural", "genuine", "authentic", "unique", "stone", "gemstone",
+        "silver", "gold", "style", "fashion", "statement", "present",
+    }
+
+    title_words = [
+        w for w in words(listing.get("title", ""))
+        if len(w) >= 3 and w not in stop
+    ]
+
+    existing_tags = [
+        normalize_text(x)
+        for x in listing.get("tags", [])
+        if str(x).strip()
+    ]
+
+    queries = []
+
+    if len(title_words) >= 3:
+        queries.append(" ".join(title_words[:3]))
+    elif len(title_words) >= 2:
+        queries.append(" ".join(title_words[:2]))
+
+    for tag in existing_tags[:3]:
+        if tag and tag not in queries:
+            queries.append(tag)
+
+    # Keep requests deliberately small so the optimizer remains fast.
+    unique = []
+    for q in queries:
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q not in unique:
+            unique.append(q)
+
+    return unique[:3]
+
+
+def marketplace_keyword_signals(queries, per_query=10):
+    """Use Etsy's ranked active-marketplace results as keyword-language signals.
+    This is not a search-volume measurement; Etsy's API does not expose exact
+    keyword search-volume numbers.
+    """
+    candidates = []
+    seen = set()
+
+    for query in queries:
+        results = public_competitor_search(query, per_query)
+        for rank, item in enumerate(results):
+            listing_id = item.get("listing_id")
+            if listing_id in seen:
+                continue
+            if listing_id:
+                seen.add(listing_id)
+
+            candidates.append({
+                "listing_id": listing_id,
+                "rank": rank + 1,
+                "title": item.get("title", ""),
+                "tags": item.get("tags", []) or [],
+                "url": item.get("url", ""),
+            })
+
+    phrase_counter = Counter()
+    tag_counter = Counter()
+
+    for item in candidates:
+        weight = 1.0 / max(item.get("rank", 1), 1)
+        title_words = [
+            w for w in words(item.get("title", ""))
+            if len(w) >= 3
+        ]
+
+        for n in (2, 3):
+            for i in range(len(title_words) - n + 1):
+                phrase = " ".join(title_words[i:i+n])
+                phrase_counter[phrase] += weight
+
+        for tag in item.get("tags", []):
+            tag = re.sub(r"\s+", " ", str(tag).strip().lower())
+            if tag:
+                tag_counter[tag] += weight
+
+    return {
+        "queries": queries,
+        "marketplace_results_checked": len(candidates),
+        "high_signal_phrases": [
+            {"phrase": p, "signal": round(v, 3)}
+            for p, v in phrase_counter.most_common(30)
+        ],
+        "high_signal_tags": [
+            {"tag": t, "signal": round(v, 3)}
+            for t, v in tag_counter.most_common(40)
+        ],
+        "sample_listings": candidates[:10],
+    }
+
+
+def optimize_existing_listing(listing, market_signals):
+    current = {
+        "title": listing.get("title", ""),
+        "tags": listing.get("tags", []) or [],
+        "description": listing.get("description", ""),
+        "materials": listing.get("materials", []) or [],
+        "taxonomy_id": listing.get("taxonomy_id"),
+    }
+
+    prompt = f"""
+You are an elite Etsy SEO and conversion strategist specializing in handmade
+Gemstone Jewelry. You are optimizing an EXISTING Etsy listing, not creating a
+random generic listing.
+
+CURRENT ETSY LISTING:
+{json.dumps(current, ensure_ascii=False)}
+
+MARKETPLACE RESEARCH SIGNALS:
+{json.dumps(market_signals, ensure_ascii=False)}
+
+GOAL:
+Create a significantly better, buyer-focused Etsy title and 13 tags based on
+what the actual product/listing says and the language appearing in ranked Etsy
+marketplace results.
+
+IMPORTANT LIMITATION:
+The Etsy API does NOT provide exact keyword search-volume numbers. Therefore,
+do NOT claim that a keyword is "the #1 most searched" or give fake search-volume
+numbers. Treat the marketplace frequency/ranking signals above as directional
+buyer-language evidence only.
+
+TITLE RULES:
+- Put the actual product name first.
+- Put the strongest objective differentiators early.
+- Prefer a concise, readable title, generally about 8-15 words.
+- Never exceed 140 characters.
+- Do not repeat the same keyword unnaturally.
+- Do not use subjective fluff such as best, perfect, gorgeous, stunning, must-have.
+- Do not copy a competitor title or distinctive phrase.
+- Do not add facts that are absent from the current listing.
+
+TAG RULES:
+- Exactly 13 tags.
+- Every tag <= 20 characters.
+- Use diverse buyer intents rather than 13 variations of one phrase.
+- Prefer specific multi-word phrases.
+- Use marketplace signals where relevant, but only if they accurately describe
+  this product.
+- Never invent gemstone identity, metal purity, origin, treatment, certification,
+  measurements, carat weight, or other unsupported facts.
+
+DESCRIPTION RULES:
+- Rewrite the description only when useful; preserve factual information.
+- First 1-2 sentences should immediately explain what the item is and its strongest
+  objective traits.
+- Make it natural and conversion-focused, not keyword stuffed.
+- Never make healing/medical claims.
+
+Return ONLY valid JSON:
+{{
+  "current_listing_analysis": {{
+    "strengths": ["..."],
+    "weaknesses": ["..."],
+    "seo_opportunities": ["..."]
+  }},
+  "recommended_title": "...",
+  "recommended_tags": ["exactly 13 tags"],
+  "recommended_description": "...",
+  "keyword_strategy": [
+    {{"keyword": "...", "reason": "..."}}
+  ],
+  "changes_summary": ["..."],
+  "search_volume_note": "Exact Etsy search volume is not available through the API; these are marketplace ranking/frequency signals."
+}}
+"""
+
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        input=prompt,
+    )
+
+    return parse_listing_json(response.output_text)
+
+
+@app.post("/analyze-existing-listing")
+async def analyze_existing_listing(
+    listing_id: str = Form(""),
+    listing_url: str = Form(""),
+):
+    """Analyze an existing Etsy listing and return an improved SEO title/tags.
+
+    This endpoint only reads/analyzes the listing. It does NOT edit, create,
+    activate, or publish anything on Etsy.
+    """
+    resolved_id = extract_listing_id(listing_id) or extract_listing_id(listing_url)
+
+    if not resolved_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter an Etsy listing ID or a full Etsy listing URL.",
+        )
+
+    context = get_shop_context()
+    access_token = context["access_token"]
+
+    url = f"https://api.etsy.com/v3/application/listings/{resolved_id}"
+    response = etsy_get(
+        url,
+        access_token,
+        params={
+            "includes": "Images",
+            "language": "en",
+            "allow_suggested_title": "true",
+            "legacy": "false",
+        },
+    )
+
+    if not response.ok:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text,
+        )
+
+    listing = response.json()
+
+    # Safety check: only analyze the listing; do not allow an arbitrary public
+    # listing to become a write target later in this endpoint.
+    if str(listing.get("shop_id")) != str(context["shop_id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="For this optimizer, use a listing from your connected Etsy shop.",
+        )
+
+    queries = listing_market_queries(listing)
+    try:
+        market_signals = marketplace_keyword_signals(queries, per_query=10)
+    except Exception as exc:
+        market_signals = {
+            "queries": queries,
+            "marketplace_results_checked": 0,
+            "high_signal_phrases": [],
+            "high_signal_tags": [],
+            "sample_listings": [],
+            "research_warning": str(exc),
+        }
+
+    optimized = optimize_existing_listing(listing, market_signals)
+
+    # Validate the proposed title/tags using the same hard constraints as the
+    # listing generator, without touching Etsy.
+    candidate = {
+        "title": optimized.get("recommended_title", ""),
+        "tags": optimized.get("recommended_tags", []),
+        "description": optimized.get("recommended_description", ""),
+    }
+    validation_errors = validate_listing(candidate)
+
+    return {
+        "status": "success" if not validation_errors else "validation_failed",
+        "message": (
+            "Existing Etsy listing analyzed. Nothing was edited, created, or published."
+        ),
+        "listing_id": resolved_id,
+        "current_listing": {
+            "title": listing.get("title", ""),
+            "tags": listing.get("tags", []) or [],
+            "description": listing.get("description", ""),
+            "materials": listing.get("materials", []) or [],
+            "taxonomy_id": listing.get("taxonomy_id"),
+            "num_favorers": listing.get("num_favorers"),
+            "url": listing.get("url", ""),
+            "etsy_suggested_title": listing.get("suggested_title"),
+        },
+        "market_research": market_signals,
+        "optimized_result": optimized,
+        "validation_errors": validation_errors,
+        "write_action_performed": False,
     }
 
 
@@ -1548,7 +1847,6 @@ async def create_draft_listing(
     keyword_research = market_keyword_research(
         product + " " + details
     )
-    time_guard("market keyword research")
 
     listing = generate_listing(
         product,
