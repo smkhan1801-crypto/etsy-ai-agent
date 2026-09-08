@@ -942,7 +942,7 @@ def public_competitor_search(keyword, limit=15):
         access_token=None,
         params={
             "keywords": keyword,
-            "limit": min(limit, 5),
+            "limit": min(limit, 20),
             "offset": 0,
             "sort_on": "score",
             "sort_order": "desc",
@@ -1479,19 +1479,24 @@ def listing_market_queries(listing):
     return unique[:3]
 
 
-def marketplace_keyword_signals(queries, per_query=10):
-    """Use Etsy's ranked active-marketplace results as keyword-language signals.
-    This is not a search-volume measurement; Etsy's API does not expose exact
-    keyword search-volume numbers.
+def marketplace_keyword_signals(queries, per_query=15):
+    """Research ranked Etsy marketplace results and score buyer-language signals.
+
+    This is directional marketplace evidence, not exact Etsy search volume.
+    Scores combine ranked-result weight, phrase frequency, query coverage, and
+    competitor-tag frequency when those fields are returned by Etsy.
     """
     candidates = []
     seen = set()
+    query_result_counts = {}
 
-    for query in queries:
+    for query in queries[:3]:
         results = public_competitor_search(query, per_query)
+        query_result_counts[query] = len(results)
+
         for rank, item in enumerate(results):
             listing_id = item.get("listing_id")
-            if listing_id in seen:
+            if listing_id and listing_id in seen:
                 continue
             if listing_id:
                 seen.add(listing_id)
@@ -1499,43 +1504,97 @@ def marketplace_keyword_signals(queries, per_query=10):
             candidates.append({
                 "listing_id": listing_id,
                 "rank": rank + 1,
+                "query": query,
                 "title": item.get("title", ""),
                 "tags": item.get("tags", []) or [],
                 "url": item.get("url", ""),
             })
 
-    phrase_counter = Counter()
-    tag_counter = Counter()
+    stop = {
+        "the", "and", "for", "with", "from", "this", "that", "your",
+        "handmade", "jewelry", "jewellery", "gift", "gifts", "women",
+        "woman", "men", "mens", "necklace", "necklaces", "natural",
+        "genuine", "authentic", "beautiful", "elegant", "fashion",
+        "style", "stone", "gemstone", "piece", "pieces",
+    }
+
+    phrase_frequency = Counter()
+    phrase_weight = Counter()
+    phrase_queries = defaultdict(set)
+    tag_frequency = Counter()
+    tag_weight = Counter()
+    tag_queries = defaultdict(set)
 
     for item in candidates:
-        weight = 1.0 / max(item.get("rank", 1), 1)
-        title_words = [
-            w for w in words(item.get("title", ""))
-            if len(w) >= 3
-        ]
+        rank = max(int(item.get("rank", 1)), 1)
+        weight = 1.0 / rank
+        title_words = [w for w in words(item.get("title", "")) if len(w) >= 3]
 
+        # Use contiguous 2- and 3-word phrases from competitor titles.
         for n in (2, 3):
             for i in range(len(title_words) - n + 1):
-                phrase = " ".join(title_words[i:i+n])
-                phrase_counter[phrase] += weight
+                phrase_words = title_words[i:i+n]
+                if any(w in stop for w in phrase_words) and n == 2:
+                    # Keep useful product phrases such as "ruby necklace" but
+                    # discard phrases made mostly from generic terms.
+                    useful = sum(w not in stop for w in phrase_words)
+                    if useful < 1:
+                        continue
+                phrase = " ".join(phrase_words)
+                if phrase in stop or len(phrase) < 5:
+                    continue
+                phrase_frequency[phrase] += 1
+                phrase_weight[phrase] += weight
+                phrase_queries[phrase].add(item.get("query", ""))
 
-        for tag in item.get("tags", []):
-            tag = re.sub(r"\s+", " ", str(tag).strip().lower())
-            if tag:
-                tag_counter[tag] += weight
+        for raw_tag in item.get("tags", []):
+            tag = re.sub(r"\s+", " ", normalize_text(raw_tag)).strip()
+            if not tag or len(tag) > 20:
+                continue
+            if tag in stop:
+                continue
+            tag_frequency[tag] += 1
+            tag_weight[tag] += weight
+            tag_queries[tag].add(item.get("query", ""))
+
+    def ranked(counter, weighted, query_sets, limit=25):
+        rows = []
+        for term, freq in counter.items():
+            coverage = len(query_sets[term])
+            score = weighted[term] + (0.35 * freq) + (0.75 * coverage)
+            rows.append({
+                "keyword": term,
+                "frequency": freq,
+                "query_coverage": coverage,
+                "signal_score": round(score, 4),
+            })
+        rows.sort(key=lambda x: (x["signal_score"], x["frequency"]), reverse=True)
+        return rows[:limit]
+
+    phrase_rows = ranked(phrase_frequency, phrase_weight, phrase_queries, 25)
+    tag_rows = ranked(tag_frequency, tag_weight, tag_queries, 25)
+
+    sample_listings = []
+    for item in sorted(candidates, key=lambda x: x.get("rank", 999))[:10]:
+        sample_listings.append({
+            "query": item.get("query", ""),
+            "rank": item.get("rank"),
+            "title": item.get("title", ""),
+            "listing_id": item.get("listing_id"),
+            "url": item.get("url", ""),
+        })
 
     return {
-        "queries": queries,
+        "queries": queries[:3],
+        "query_result_counts": query_result_counts,
         "marketplace_results_checked": len(candidates),
-        "high_signal_phrases": [
-            {"phrase": p, "signal": round(v, 3)}
-            for p, v in phrase_counter.most_common(30)
-        ],
-        "high_signal_tags": [
-            {"tag": t, "signal": round(v, 3)}
-            for t, v in tag_counter.most_common(40)
-        ],
-        "sample_listings": candidates[:10],
+        "high_signal_phrases": phrase_rows,
+        "high_signal_tags": tag_rows,
+        "sample_listings": sample_listings,
+        "method_note": (
+            "Signal score uses Etsy ranked marketplace results, phrase frequency, "
+            "query coverage, and rank weighting. It is not Etsy search volume."
+        ),
     }
 
 
@@ -1558,6 +1617,12 @@ CURRENT ETSY LISTING:
 
 MARKETPLACE RESEARCH SIGNALS:
 {json.dumps(market_signals, ensure_ascii=False)}
+
+INTERPRETATION:
+- Give more weight to keywords with stronger signal_score, higher frequency, and wider query coverage.
+- Prefer phrases that accurately match this listing over merely frequent generic phrases.
+- Do not blindly copy competitor tags or titles; use them only as market-language evidence.
+- Build a balanced tag set across core product, gemstone, material, style/use, occasion, and buyer-intent phrases where truthful.
 
 GOAL:
 Create a significantly better, buyer-focused Etsy title and 13 tags based on
@@ -1802,7 +1867,7 @@ async def analyze_existing_listing(
 
     queries = listing_market_queries(listing)
     try:
-        market_signals = marketplace_keyword_signals(queries, per_query=10)
+        market_signals = marketplace_keyword_signals(queries, per_query=15)
     except Exception as exc:
         market_signals = {
             "queries": queries,
