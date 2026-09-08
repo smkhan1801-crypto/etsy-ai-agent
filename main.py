@@ -661,3 +661,4 @@ def etsy_config():
         "processing_profiles": processing_data,
         "seller_taxonomy": taxonomy_data,
     }
+/etsy/config
