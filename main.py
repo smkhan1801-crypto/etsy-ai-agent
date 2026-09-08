@@ -640,6 +640,22 @@ def etsy_config():
     if processing_response.ok:
         processing_data = processing_response.json()
 
+    # Get shipping profiles
+    shipping_url = (
+        f"https://api.etsy.com/v3/application/shops/"
+        f"{shop_id}/shipping-profiles"
+    )
+
+    shipping_response = etsy_get(
+        shipping_url,
+        access_token
+    )
+
+    shipping_data = {}
+
+    if shipping_response.ok:
+        shipping_data = shipping_response.json()
+
     # Get seller taxonomy
     taxonomy_url = (
         "https://api.etsy.com/v3/application/seller-taxonomy/nodes"
@@ -659,6 +675,6 @@ def etsy_config():
         "shop_id": shop_id,
         "shop_name": shop.get("shop_name"),
         "processing_profiles": processing_data,
+        "shipping_profiles": shipping_data,
         "seller_taxonomy": taxonomy_data,
     }
-/etsy/config
