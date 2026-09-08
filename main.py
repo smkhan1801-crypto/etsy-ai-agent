@@ -1099,6 +1099,14 @@ async def generate_listing_photo(
     image: UploadFile = File(...),
     extra_info: str = Form(""),
 ):
+    """
+    Full photo-to-listing workflow.
+
+    This endpoint analyzes the image, generates the Etsy listing,
+    validates claims/SEO, checks similarity against Etsy listings,
+    and rewrites when needed. It does NOT create or publish an Etsy draft.
+    """
+
     if (
         not image.content_type
         or not image.content_type.startswith("image/")
@@ -1117,39 +1125,32 @@ async def generate_listing_photo(
         )
 
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:{image.content_type};base64,{image_base64}"
 
-    image_data_url = (
-        f"data:{image.content_type};base64,{image_base64}"
-    )
+    # ---------------------------------------------------------------
+    # 1. IMAGE ANALYSIS
+    # ---------------------------------------------------------------
 
-    prompt = f"""
+    analysis_prompt = f"""
 Analyze this jewelry photograph for an Etsy listing.
 
-Seller information:
+Seller-confirmed information:
 {extra_info}
 
-Only identify what can reasonably be observed.
+Only identify what can reasonably be observed from the photograph.
+Do not infer gemstone identity, natural/genuine status, metal purity,
+origin, treatment, certification, measurements or carat weight from
+appearance alone.
 
-Do NOT invent:
-- gemstone identity
-- natural/genuine status
-- gemstone origin
-- treatment
-- certification
-- metal purity
-- measurements
-- carat weight
-- authenticity
-
-Return a concise structured analysis with:
+Return a concise analysis covering:
 1. product type
 2. visible design details
 3. visible colors
 4. visible setting details
-5. claims requiring seller verification
+5. facts requiring seller verification
 """
 
-    response = client.responses.create(
+    analysis_response = client.responses.create(
         model="gpt-5.6-luna",
         input=[
             {
@@ -1157,7 +1158,7 @@ Return a concise structured analysis with:
                 "content": [
                     {
                         "type": "input_text",
-                        "text": prompt,
+                        "text": analysis_prompt,
                     },
                     {
                         "type": "input_image",
@@ -1168,9 +1169,102 @@ Return a concise structured analysis with:
         ],
     )
 
+    analysis = analysis_response.output_text
+
+    # ---------------------------------------------------------------
+    # 2. GENERATE FULL ETSY LISTING
+    # ---------------------------------------------------------------
+
+    product_context = (
+        "Jewelry product shown in the uploaded photograph.\n\n"
+        "IMAGE OBSERVATIONS:\n" + analysis
+    )
+
+    listing = generate_listing(
+        product_context,
+        extra_info,
+        extra_info,
+    )
+
+    # ---------------------------------------------------------------
+    # 3. VALIDATION + ORIGINALITY SCREEN + AUTO REWRITE
+    # ---------------------------------------------------------------
+
+    context = get_shop_context()
+
+    own_listings = get_own_active_listings(
+        context["access_token"],
+        context["shop_id"],
+    )
+
+    rewrite_count = 0
+    originality = None
+    claim_problems = []
+    validation_errors = []
+
+    for attempt in range(4):
+        validation_errors = validate_listing(listing)
+
+        claim_problems = has_unsupported_claims(
+            listing,
+            extra_info,
+            extra_info,
+        )
+
+        competitors = competitor_candidates(listing)
+
+        originality = originality_report(
+            listing,
+            own_listings,
+            competitors,
+        )
+
+        if (
+            not validation_errors
+            and not claim_problems
+            and originality["passed"]
+        ):
+            break
+
+        if attempt == 3:
+            return {
+                "status": "blocked_before_draft",
+                "message": (
+                    "The listing did not pass validation/originality checks. "
+                    "No Etsy draft was created."
+                ),
+                "analysis": analysis,
+                "listing": listing,
+                "validation_errors": validation_errors,
+                "unsupported_claims": claim_problems,
+                "originality": originality,
+                "rewrite_attempts": rewrite_count,
+                "draft_created": False,
+                "published": False,
+            }
+
+        listing = rewrite_listing(
+            listing,
+            originality.get("matches", []),
+            claim_problems,
+        )
+        rewrite_count += 1
+
     return {
         "status": "success",
-        "analysis": response.output_text,
+        "message": (
+            "Full Etsy listing generated and passed the current checks. "
+            "No Etsy draft was created by this endpoint."
+        ),
+        "analysis": analysis,
+        "listing": listing,
+        "validation_errors": validation_errors,
+        "unsupported_claims": claim_problems,
+        "originality": originality,
+        "rewrite_attempts": rewrite_count,
+        "draft_created": False,
+        "published": False,
+        "next_step": "POST /create-draft-listing",
     }
 
 
