@@ -582,3 +582,82 @@ metal purity, origin, treatment or measurements.
         "status": "success",
         "listing": response.output_text
     }
+# ---------------------------------------------------------
+# ETSY SHOP CONFIG
+# ---------------------------------------------------------
+
+@app.get("/etsy/config")
+def etsy_config():
+
+    token_data = get_valid_etsy_token()
+
+    if not token_data:
+        raise HTTPException(
+            status_code=401,
+            detail="Etsy account is not connected."
+        )
+
+    access_token = token_data.get("access_token")
+
+    user_id = access_token.split(".")[0]
+
+    # Get shop
+    shops_url = (
+        f"https://api.etsy.com/v3/application/users/"
+        f"{user_id}/shops"
+    )
+
+    shop_response = etsy_get(
+        shops_url,
+        access_token
+    )
+
+    if not shop_response.ok:
+        raise HTTPException(
+            status_code=shop_response.status_code,
+            detail=shop_response.text
+        )
+
+    shop_data = shop_response.json()
+
+    shop = shop_data.get("shop", shop_data)
+
+    shop_id = shop.get("shop_id")
+
+    # Get processing profiles
+    processing_url = (
+        f"https://api.etsy.com/v3/application/shops/"
+        f"{shop_id}/readiness-state-definitions"
+    )
+
+    processing_response = etsy_get(
+        processing_url,
+        access_token
+    )
+
+    processing_data = {}
+
+    if processing_response.ok:
+        processing_data = processing_response.json()
+
+    # Get seller taxonomy
+    taxonomy_url = (
+        "https://api.etsy.com/v3/application/seller-taxonomy/nodes"
+    )
+
+    taxonomy_response = etsy_get(
+        taxonomy_url,
+        access_token
+    )
+
+    taxonomy_data = {}
+
+    if taxonomy_response.ok:
+        taxonomy_data = taxonomy_response.json()
+
+    return {
+        "shop_id": shop_id,
+        "shop_name": shop.get("shop_name"),
+        "processing_profiles": processing_data,
+        "seller_taxonomy": taxonomy_data,
+    }
