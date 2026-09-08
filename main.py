@@ -658,6 +658,66 @@ def choose_taxonomy_id(taxonomy_data, product_text):
 
 
 # -------------------------------------------------------------------
+# ETSY MARKET KEYWORD RESEARCH
+# -------------------------------------------------------------------
+
+def extract_keyword_signals(listings, max_terms=18):
+    """Extract recurring 2-3 word search phrases from marketplace titles.
+    These are used only as keyword signals; seller wording is never copied.
+    """
+    stop = {
+        "handmade", "jewelry", "jewellery", "ring", "rings", "gift",
+        "gifts", "for", "the", "and", "with", "women", "woman",
+        "mens", "men", "natural", "genuine", "authentic", "beautiful",
+        "elegant", "perfect", "unique", "stone", "gemstone", "silver",
+        "gold", "fashion", "style", "wear", "wearable", "present",
+        "anniversary", "birthday", "wedding", "statement"
+    }
+    counter = Counter()
+    for item in listings:
+        title = normalize_text(item.get("title", ""))
+        w = [x for x in title.split() if len(x) >= 3]
+        # Count useful 2- and 3-word phrases, while retaining product terms.
+        for n in (2, 3):
+            for i in range(len(w) - n + 1):
+                phrase = " ".join(w[i:i+n])
+                parts = phrase.split()
+                if all(x in stop for x in parts):
+                    continue
+                if sum(x not in stop for x in parts) == 0:
+                    continue
+                counter[phrase] += 1
+    return [p for p, _ in counter.most_common(max_terms)]
+
+
+def market_keyword_research(seed_text):
+    """One fast Etsy marketplace lookup used to discover buyer-language signals."""
+    words_seed = [
+        w for w in words(seed_text)
+        if len(w) >= 3 and w not in {
+            "handmade", "jewelry", "jewellery", "beautiful", "elegant",
+            "natural", "genuine", "authentic", "gift", "women", "woman"
+        }
+    ]
+    query = " ".join(words_seed[:5]).strip()
+    if not query:
+        query = "gemstone ring"
+    try:
+        results = public_competitor_search(query, limit=12)
+        return {
+            "query": query,
+            "result_count": len(results),
+            "keyword_signals": extract_keyword_signals(results),
+        }
+    except Exception:
+        return {
+            "query": query,
+            "result_count": 0,
+            "keyword_signals": [],
+        }
+
+
+# -------------------------------------------------------------------
 # AI LISTING GENERATION
 # -------------------------------------------------------------------
 
@@ -688,13 +748,16 @@ def parse_listing_json(text):
     return data
 
 
-def generate_listing(product, details, seller_claims=""):
+def generate_listing(product, details, seller_claims="", keyword_signals=None):
+    keyword_signals = keyword_signals or []
+
     prompt = f"""
-You are an expert Etsy SEO listing agent for handmade gemstone jewelry.
+You are a senior Etsy SEO copywriter and conversion-focused listing strategist
+for handmade gemstone jewelry. Your goal is to create a listing that is highly
+relevant to real buyer searches while remaining clear, original, truthful, and
+pleasant to read.
 
-Create ONE original Etsy listing from the seller information below.
-
-PRODUCT:
+PRODUCT / IMAGE CONTEXT:
 {product}
 
 SELLER DETAILS:
@@ -703,30 +766,55 @@ SELLER DETAILS:
 SELLER-CONFIRMED CLAIMS:
 {seller_claims}
 
-IMPORTANT FACT RULES:
-- Only use gemstone identity, metal type, purity, natural/genuine status,
-  origin, treatment, certification, dimensions, carat weight and measurements
-  when the seller supplied that fact.
-- Never infer "natural", "genuine", "authentic", "solid gold", "925",
-  certification, origin or treatment from a photograph.
-- Do not invent measurements or carat weight.
-- Do not copy another seller's wording.
-- Use normal buyer-friendly Etsy SEO.
-- Title must be <= 140 characters.
-- Produce exactly 13 tags.
-- Every tag must be <= 20 characters.
-- Avoid keyword stuffing.
-- Description must be original and readable.
+CURRENT ETSY MARKET KEYWORD SIGNALS (use only as search-language clues):
+{json.dumps(keyword_signals, ensure_ascii=False)}
 
-Return ONLY valid JSON with this exact structure:
+CURRENT ETSY TITLE GUIDANCE:
+- Clearly name the item once.
+- Put the most important objective traits near the beginning: product type,
+  gemstone/color, material, and another genuinely important differentiator.
+- Prefer a concise title of roughly 8-15 words when possible; never exceed 140 characters.
+- Do not keyword-stuff, repeat the same word, or stack synonyms unnaturally.
+- Do not add "best", "perfect", "beautiful", "unique", "must have", or similar
+  subjective sales language to the title.
+- Do not add shipping, price, sale, or generic recipient/gift phrases unless they
+  are genuinely essential to what the item is.
 
+SEO / CONVERSION REQUIREMENTS:
+- Build the title around the strongest, most specific buyer intent.
+- Use the keyword signals only to understand search language. NEVER copy a
+  competitor title or distinctive phrase.
+- Use all 13 tags. Tags should be natural multi-word phrases, diverse, specific,
+  and complementary rather than 13 near-duplicates.
+- Use attributes/materials as supporting relevance rather than stuffing the title.
+- The first sentence of the description must immediately identify the item and
+  its strongest buyer-relevant traits.
+- Description should be original and conversion-focused: what it is, design/details,
+  materials/facts, who it suits or occasions when genuinely relevant, and a concise
+  buyer-information section. Do not invent sizing, care, origin, certification,
+  treatment, carat weight, or other facts.
+- Do not make medical/healing claims.
+- Do not claim natural/genuine/authentic/925/metal purity/etc. unless seller supplied it.
+
+FACT SAFETY:
+- Only use gemstone identity, metal type, purity, natural/genuine status, origin,
+  treatment, certification, dimensions, carat weight and measurements when the seller
+  supplied that fact.
+- Never infer these claims from a photograph.
+
+ORIGINALITY:
+- Write from scratch.
+- Do not imitate a competitor's sentence structure or distinctive wording.
+- Common product/SEO words may naturally overlap.
+
+Return ONLY valid JSON with exactly this structure:
 {{
   "title": "string",
-  "tags": ["13 tags"],
+  "tags": ["exactly 13 tags"],
   "description": "string",
   "materials": ["seller-confirmed materials only"],
-  "gift_keywords": ["short phrases"],
-  "observed_facts": ["facts actually supplied or observable"],
+  "gift_keywords": ["short relevant phrases only"],
+  "observed_facts": ["facts supplied by seller or visibly observable"],
   "verification_needed": ["claims that still need seller verification"]
 }}
 """
@@ -996,6 +1084,20 @@ def validate_listing(candidate):
     if len(title) > 140:
         errors.append("Title is longer than 140 characters.")
 
+    title_word_list = words(title)
+    if len(title_word_list) > 15:
+        errors.append("Title should be 15 words or fewer for buyer-friendly readability.")
+
+    if len(title_word_list) != len(set(title_word_list)):
+        errors.append("Title repeats words; rewrite for cleaner readability.")
+
+    subjective_title_words = {
+        "best", "perfect", "beautiful", "unique", "must", "amazing",
+        "stunning", "gorgeous", "premium", "luxury"
+    }
+    if subjective_title_words.intersection(title_word_list):
+        errors.append("Title contains subjective sales language; keep it factual and buyer-friendly.")
+
     if not isinstance(tags, list):
         errors.append("Tags must be a list.")
         tags = []
@@ -1156,10 +1258,17 @@ Return a concise analysis covering:
         "IMAGE OBSERVATIONS:\n" + analysis
     )
 
+    # Use a single marketplace lookup as keyword research before copywriting.
+    keyword_research = market_keyword_research(
+        product_context + " " + extra_info
+    )
+    time_guard("market keyword research")
+
     listing = generate_listing(
         product_context,
         extra_info,
         extra_info,
+        keyword_research.get("keyword_signals", []),
     )
 
     # ---------------------------------------------------------------
@@ -1234,6 +1343,7 @@ Return a concise analysis covering:
             "No Etsy draft was created by this endpoint."
         ),
         "analysis": analysis,
+        "keyword_research": keyword_research,
         "listing": listing,
         "validation_errors": validation_errors,
         "unsupported_claims": claim_problems,
@@ -1432,13 +1542,19 @@ async def create_draft_listing(
         }
 
     # ---------------------------------------------------------------
-    # AI LISTING
+    # MARKET KEYWORD RESEARCH + AI LISTING
     # ---------------------------------------------------------------
+
+    keyword_research = market_keyword_research(
+        product + " " + details
+    )
+    time_guard("market keyword research")
 
     listing = generate_listing(
         product,
         details,
         seller_claims,
+        keyword_research.get("keyword_signals", []),
     )
     time_guard("AI listing generation")
 
@@ -1638,6 +1754,7 @@ async def create_draft_listing(
             "It was NOT published."
         ),
         "listing": listing,
+        "keyword_research": keyword_research,
         "etsy_draft": draft,
         "listing_id": listing_id,
         "shipping_profile": {
