@@ -1355,12 +1355,15 @@ def validate_listing(candidate):
 
 
 def seo_score_report(current_listing, optimized_result, market_signals, validation_errors=None, identity=None):
-    """V4 evidence-aware deterministic SEO quality score.
+    """V5 evidence-aware deterministic SEO quality score.
 
-    This is an internal quality rubric, not Etsy's ranking score.
-    Every point is tied to an observable condition. Unavailable Etsy metadata
-    is excluded rather than treated as a failure. Hard identity/format errors
-    are reported separately so they are not double-counted in buyer quality.
+    The score measures the quality of the optimizer output against observable
+    Etsy/listing evidence. It is not Etsy's ranking score.
+
+    Important V5 rule:
+    A keyword is scoreable only when it is supported by source product facts
+    or by the optimizer's marketplace-signal set. Missing/unavailable evidence
+    is not turned into a fake failure merely to lower or raise the score.
     """
     validation_errors = validation_errors or []
     identity = identity or extract_product_identity(current_listing)
@@ -1385,7 +1388,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         term = normalize_text(term or "")
         return bool(term and (re.search(r"\b" + re.escape(term) + r"\b", text_norm) or term in text_norm))
 
-    # ---------------- Product identity: 15 ----------------
+    # ---------- Product identity 15 ----------
     ip, ir = 0, []
     if not product_type or has_term(tn, product_type):
         ip += 5
@@ -1404,15 +1407,13 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         ir.append("Primary gemstone is missing from the description.")
 
-    # ---------------- Title: 15 ----------------
+    # ---------- Title 15 ----------
     tp, tr = 0, []
     if title:
         tp += 3
     else:
         tr.append("Title is empty.")
 
-    # Etsy's current guidance favors concise titles; 8–15 is a quality target,
-    # not a cliff at 13. Any 8–15 word title receives full word-count credit.
     if 8 <= len(tw) <= 15:
         tp += 3
     elif 6 <= len(tw) <= 17:
@@ -1442,9 +1443,8 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         tr.append("Place the actual product type near the beginning.")
 
-    # ---------------- Tags: 20 ----------------
+    # ---------- Tags 20 ----------
     gp, gr = 0, []
-
     if len(tags) == 13:
         gp += 4
     else:
@@ -1463,8 +1463,6 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         gr.append("Remove duplicate tags.")
 
-    # Product relevance: tag must contain or be contained by at least one
-    # protected product/gemstone term. This is deliberately conservative.
     relevant = sum(
         1 for t in tag_norm
         if any(p and (p in t or t in p) for p in protected)
@@ -1474,12 +1472,9 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     if tags and relevant < max(7, round(len(tags) * 0.55)):
         gr.append("More tags should directly reinforce the source product.")
 
-    # Phrase-structure diversity: shared core terms are allowed. We only flag
-    # near-identical phrase structures.
-    distinct_phrases = len(set(tag_norm))
     starts = [t.split()[0] for t in tag_norm if t.split()]
     distinct_starts = len(set(starts))
-    if distinct_phrases == len(tags) and distinct_starts >= min(8, len(tags)):
+    if len(tags) == 13 and unique_ratio == 1 and distinct_starts >= 8:
         gp += 4
     else:
         gp += round(4 * min(1, distinct_starts / max(1, len(tags))))
@@ -1487,30 +1482,93 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
             gr.append("Use a broader mix of search-phrase structures.")
     gp = min(20, gp)
 
-    # ---------------- Keyword coverage: 15 ----------------
-    kp, kr = 0, []
-    groups = [
+    # ---------- V5 keyword evidence ----------
+    # Gather marketplace phrases from whatever structure the existing research
+    # helper returned. These are directional signals, not exact search volume.
+    signal_phrases = set()
+
+    def collect_strings(value):
+        if isinstance(value, str):
+            s = normalize_text(value)
+            if 2 <= len(s.split()) <= 8 and len(s) <= 80:
+                signal_phrases.add(s)
+        elif isinstance(value, list):
+            for item in value:
+                collect_strings(item)
+        elif isinstance(value, dict):
+            for key, value2 in value.items():
+                if key.lower() not in {"score", "count", "rank", "id"}:
+                    collect_strings(value2)
+
+    collect_strings(market_signals or {})
+
+    # Source-supported terms are always eligible. Marketplace phrases are
+    # eligible only if they also overlap the source identity or current listing.
+    source_evidence = set(protected)
+    for value in [
+        product_type, primary_gem,
+        current_listing.get("title", ""),
+        current_listing.get("description", ""),
+        *(current_listing.get("tags", []) or []),
+        *(current_listing.get("materials", []) or []),
+        *(current_listing.get("style", []) or []),
+    ]:
+        s = normalize_text(str(value))
+        if s:
+            source_evidence.add(s)
+
+    def keyword_supported(k):
+        k = normalize_text(k)
+        if not k:
+            return False
+        if any(k in e or e in k for e in source_evidence if e):
+            return True
+        # Marketplace phrase must share meaningful identity words.
+        kwords = set(re.findall(r"[a-z0-9]+", k))
+        identity_words = set(re.findall(
+            r"[a-z0-9]+",
+            normalize_text(" ".join([product_type, primary_gem] + gems))
+        ))
+        return len(kwords & identity_words) >= 1 and k in signal_phrases
+
+    # Only score the first few AI suggestions in each group. Empty/unavailable
+    # groups do not create fabricated "missing keyword" penalties.
+    keyword_groups = [
         ("primary_keywords", 6, 5),
         ("secondary_keywords", 4, 5),
         ("long_tail_keywords", 3, 3),
         ("buyer_intent_keywords", 2, 2),
     ]
-    for key, pts, take in groups:
-        vals = [normalize_text(x) for x in ki.get(key, []) if str(x).strip()]
-        vals = list(dict.fromkeys(vals))
-        if vals:
-            considered = vals[:take]
-            covered = sum(1 for k in considered if k and k in alln)
-            kp += round(pts * covered / len(considered))
-            if covered < len(considered):
-                kr.append(f"Some {key.replace('_',' ')} are not covered by the listing copy.")
-        else:
-            # The model may legitimately have no buyer-intent phrase. Do not
-            # manufacture a keyword just to earn points; record it as a gap.
-            kr.append(f"No {key.replace('_',' ')} were returned.")
+    kp = 0
+    kr = []
+    for key, pts, take in keyword_groups:
+        vals = list(dict.fromkeys(
+            normalize_text(x) for x in (ki.get(key, []) or []) if str(x).strip()
+        ))
+        eligible = [k for k in vals[:take] if keyword_supported(k)]
+        if not vals:
+            # No source/model evidence to score for this group.
+            continue
+        if not eligible:
+            # The AI supplied phrases, but none are evidence-supported. This is
+            # a real quality problem, so it gets no credit for that group.
+            kr.append(f"{key.replace('_',' ')} are not sufficiently supported by listing evidence.")
+            continue
+
+        covered = sum(1 for k in eligible if k in alln)
+        kp += round(pts * covered / len(eligible))
+        if covered < len(eligible):
+            kr.append(f"Some supported {key.replace('_',' ')} are not covered by the listing copy.")
+
+    # Direct identity keyword coverage gets explicit credit even when the model's
+    # keyword list is sparse.
+    direct_identity_terms = [x for x in [product_type, primary_gem] + gems if x]
+    direct_hits = sum(1 for x in direct_identity_terms if has_term(alln, x))
+    if direct_identity_terms:
+        kp += min(2, direct_hits)
     kp = min(15, kp)
 
-    # ---------------- Description: 15 ----------------
+    # ---------- Description 15 ----------
     dp, dr = 0, []
     if description:
         dp += 3
@@ -1553,7 +1611,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         dr.append("Add useful buyer information where the source listing supports it.")
     dp = min(15, dp)
 
-    # ---------------- Category / attributes: 10 ----------------
+    # ---------- Category / attributes 10 ----------
     attrs = current_listing.get("attributes", []) or []
     taxonomy_id = current_listing.get("taxonomy_id")
     taxonomy_properties = current_listing.get("taxonomy_properties", []) or []
@@ -1592,9 +1650,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     ap_max_applicable = max(1, 10 - excluded_attribute_points)
     ap = min(ap_max_applicable, ap_earned)
 
-    # ---------------- Buyer/conversion quality: 10 ----------------
-    # IMPORTANT: validation_errors are shown separately and are NOT deducted
-    # here, preventing double-counting a technical/identity error.
+    # ---------- Buyer / conversion 10 ----------
     bp, br = 0, []
 
     if len(description) >= 250:
@@ -1614,11 +1670,10 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         br.append("Make supported material/gemstone information easy to find.")
 
-    # One point for useful context, but never require the word "gift".
+    # Gift language is optional; award this point when useful buyer context exists.
     if re.search(r"\b(gift|birthday|anniversary|wedding|holiday|present|everyday|occasion|wear)\b", dn):
         bp += 1
     else:
-        # Neutral conversion point: the absence of gift language is not a failure.
         bp += 1
 
     if not re.search(r"\b(heal|healing|cure|treat|medical)\b", alln):
@@ -1626,7 +1681,6 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         br.append("Remove medical/healing claims.")
 
-    # Final point = buyer clarity, not technical validation.
     if product_type and primary_gem and has_term(fn, product_type) and has_term(fn, primary_gem):
         bp += 1
     else:
@@ -1693,8 +1747,9 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. V4 does not deduct unavailable Etsy "
-            "metadata and does not double-count hard validation errors."
+            "It is not Etsy's ranking score. V5 only scores keyword coverage "
+            "against source/listing evidence or marketplace signals and never "
+            "treats unavailable Etsy metadata as a failure."
         ),
     }
 
