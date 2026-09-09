@@ -1600,10 +1600,14 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
             kr.append(f"{key.replace('_',' ')} are not sufficiently supported by listing evidence.")
             continue
 
-        covered = sum(1 for k in eligible if k in alln)
+        missing = [k for k in eligible if k not in alln]
+        covered = len(eligible) - len(missing)
         kp += round(pts * covered / len(eligible))
-        if covered < len(eligible):
-            kr.append(f"Some supported {key.replace('_',' ')} are not covered by the listing copy.")
+        if missing:
+            kr.append(
+                f"Missing supported {key.replace('_',' ')}: "
+                + ", ".join(missing[:5])
+            )
 
     # Direct identity keyword coverage gets explicit credit even when the model's
     # keyword list is sparse.
@@ -2568,6 +2572,9 @@ PRODUCT IDENTITY LOCK:
 CURRENT RESULT:
 {json.dumps(optimized, ensure_ascii=False)}
 
+EXACT NEXT-ROUND INSTRUCTION:
+{optimized.get("_keyword_gap_instruction", "No extra keyword-gap instruction.")}
+
 SCORE REPORT:
 {json.dumps(score_report, ensure_ascii=False)}
 
@@ -2631,7 +2638,9 @@ Return ONLY valid JSON:
 }}
 """
     response = ai_response_create(input_data=prompt, max_output_tokens=3200)
-    return parse_listing_json(response.output_text)
+    result = parse_listing_json(response.output_text)
+    result.pop("_keyword_gap_instruction", None)
+    return result
 
 @app.get("/optimizer", response_class=HTMLResponse)
 def optimizer_page(listing_id: str = Query("")):
@@ -2645,7 +2654,7 @@ def optimizer_page(listing_id: str = Query("")):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer — V8</title>
+<title>Etsy AI SEO Optimizer — V9</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -2999,18 +3008,22 @@ async def analyze_existing_listing(
             listing, optimized, score, identity, market_signals
         )
 
-        # If keyword coverage is still the only material gap, make the next
-        # round explicitly aware of the missing supported phrases.
+        # Extract exact supported phrases from the deterministic report and
+        # pass them directly into the next improvement prompt.
         keyword_gap_phrases = []
         for gap in score.get("gaps", []):
             if gap.get("section") == "Keyword coverage":
                 for reason in gap.get("reasons", []):
-                    keyword_gap_phrases.append(str(reason))
+                    m = re.search(r"Missing supported [^:]+: (.+)$", str(reason))
+                    if m:
+                        keyword_gap_phrases.extend(
+                            [x.strip() for x in m.group(1).split(",") if x.strip()]
+                        )
         if keyword_gap_phrases:
             optimized["_keyword_gap_instruction"] = (
-                "Before the next validation, ensure the exact supported keyword "
-                "phrases behind this gap are naturally covered where factual: "
-                + " | ".join(keyword_gap_phrases[:5])
+                "EXACT SUPPORTED PHRASES STILL MISSING. Incorporate these naturally "
+                "where factual and within Etsy limits: "
+                + " | ".join(dict.fromkeys(keyword_gap_phrases)[:8])
             )
 
     optimized = best
