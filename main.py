@@ -1792,7 +1792,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. V6 only scores keyword coverage "
+            "It is not Etsy's ranking score. V8 only scores keyword coverage "
             "against source/listing evidence or marketplace signals and never "
             "treats unavailable Etsy metadata as a failure."
         ),
@@ -2579,6 +2579,13 @@ MARKETPLACE SIGNALS:
 Fix the listed gaps without inventing facts.
 
 You must optimize toward every applicable deterministic check.
+For every reported "keyword coverage" gap, inspect the exact supported keyword
+phrase named in the score report. If it is supported by the source listing or
+marketplace evidence, incorporate it naturally into the title, one tag, or the
+description where it fits Etsy's limits. Do not merely mention that the keyword
+exists; actually cover it in the returned content.
+For long-tail keywords, preserve the full phrase when it is factual and fits
+naturally. Never force an unsupported phrase just to raise the score.
 Do not weaken, remove, or bypass a validation rule to increase the score.
 Do not add the word "gift" merely for scoring.
 Do not add unsupported attributes, measurements, materials, gemstone names,
@@ -2638,7 +2645,7 @@ def optimizer_page(listing_id: str = Query("")):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer — V7</title>
+<title>Etsy AI SEO Optimizer — V8</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -2939,14 +2946,14 @@ async def analyze_existing_listing(
     optimized = optimize_existing_listing(listing, market_signals)
     identity = extract_product_identity(listing)
 
-    # Up to 3 deterministic validation/improvement rounds. Gemini suggests edits;
+    # Up to 5 targeted deterministic validation/improvement rounds. Gemini suggests edits;
     # the score is always calculated by the rules above.
     score_history = []
     best = optimized
     best_score = -1
     best_errors = []
 
-    for round_no in range(3):
+    for round_no in range(5):
         candidate = {
             "title": optimized.get("recommended_title", ""),
             "tags": optimized.get("recommended_tags", []),
@@ -2985,12 +2992,26 @@ async def analyze_existing_listing(
 
         if score["is_genuine_100"]:
             break
-        if round_no == 2:
+        if round_no == 4:
             break
 
         optimized = improve_existing_listing_for_score(
             listing, optimized, score, identity, market_signals
         )
+
+        # If keyword coverage is still the only material gap, make the next
+        # round explicitly aware of the missing supported phrases.
+        keyword_gap_phrases = []
+        for gap in score.get("gaps", []):
+            if gap.get("section") == "Keyword coverage":
+                for reason in gap.get("reasons", []):
+                    keyword_gap_phrases.append(str(reason))
+        if keyword_gap_phrases:
+            optimized["_keyword_gap_instruction"] = (
+                "Before the next validation, ensure the exact supported keyword "
+                "phrases behind this gap are naturally covered where factual: "
+                + " | ".join(keyword_gap_phrases[:5])
+            )
 
     optimized = best
     validation_errors = best_errors
