@@ -15,7 +15,8 @@ import redis
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
-from openai import OpenAI, RateLimitError
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
@@ -32,8 +33,52 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         },
     )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=25, max_retries=0)
-AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+_gemini_client = None
+
+def get_gemini_client():
+    global _gemini_client
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is missing. Add your Google AI Studio API key "
+            "to Render Environment Variables and redeploy."
+        )
+    if _gemini_client is None:
+        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini_client
+
+class GeminiTextResponse:
+    def __init__(self, text):
+        self.output_text = text or ""
+
+def gemini_generate_text(prompt, max_output_tokens=3000, json_mode=False):
+    config_kwargs = {"max_output_tokens": max_output_tokens}
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
+
+    response = get_gemini_client().models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(**config_kwargs),
+    )
+    text = getattr(response, "text", None) or ""
+    if not text:
+        raise RuntimeError("Gemini returned an empty response.")
+    return GeminiTextResponse(text)
+
+def gemini_generate_image_text(prompt, image_bytes, mime_type, max_output_tokens=1200):
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+    response = get_gemini_client().models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[prompt, image_part],
+        config=types.GenerateContentConfig(max_output_tokens=max_output_tokens),
+    )
+    text = getattr(response, "text", None) or ""
+    if not text:
+        raise RuntimeError("Gemini returned an empty image-analysis response.")
+    return GeminiTextResponse(text)
 
 ETSY_KEYSTRING = os.getenv("ETSY_API_KEYSTRING")
 ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET")
@@ -82,6 +127,8 @@ def home():
         "mode": "existing_listing_seo_optimizer",
         "optimizer_ui": "/optimizer",
         "docs": "/docs",
+        "ai_backend": "Google Gemini Free Tier",
+        "ai_model": GEMINI_MODEL,
     }
 
 
@@ -835,33 +882,26 @@ Return ONLY valid JSON with exactly this structure:
 }}
 """
 
-    response = client.responses.create(
-        model=AI_MODEL,
-        input=prompt,
+    response = gemini_generate_text(
+        prompt,
+        max_output_tokens=3000,
+        json_mode=True,
     )
 
     return parse_listing_json(response.output_text)
 
 
 # -------------------------------------------------------------------
-# OPENAI REQUEST HELPERS
+# GEMINI REQUEST HELPERS
 # -------------------------------------------------------------------
 
 def ai_response_create(*, input_data, max_output_tokens=3000):
-    """Call OpenAI without multiplying rate-limit usage on 429 errors."""
-    try:
-        return client.responses.create(
-            model=AI_MODEL,
-            input=input_data,
-            max_output_tokens=max_output_tokens,
-        )
-    except RateLimitError as exc:
-        raise RuntimeError(
-            "OpenAI API rate limit reached. The optimizer stopped immediately "
-            "instead of retrying and consuming more tokens. Please wait for the "
-            "limit to reset, or raise the API rate limit/usage tier. "
-            f"Original error: {exc}"
-        ) from exc
+    """Generate optimizer output with Gemini Free Tier."""
+    return gemini_generate_text(
+        input_data,
+        max_output_tokens=max_output_tokens,
+        json_mode=True,
+    )
 
 
 # -------------------------------------------------------------------
@@ -1266,9 +1306,10 @@ Rules:
 }}
 """
 
-    response = client.responses.create(
-        model=AI_MODEL,
-        input=prompt,
+    response = gemini_generate_text(
+        prompt,
+        max_output_tokens=3000,
+        json_mode=True,
     )
 
     return parse_listing_json(response.output_text)
@@ -1308,9 +1349,6 @@ async def generate_listing_photo(
             detail="Image is too large. Please use an image under 10 MB.",
         )
 
-    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-    image_data_url = f"data:{image.content_type};base64,{image_base64}"
-
     # ---------------------------------------------------------------
     # 1. IMAGE ANALYSIS
     # ---------------------------------------------------------------
@@ -1334,23 +1372,11 @@ Return a concise analysis covering:
 5. facts requiring seller verification
 """
 
-    analysis_response = client.responses.create(
-        model=AI_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": analysis_prompt,
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url,
-                    },
-                ],
-            }
-        ],
+    analysis_response = gemini_generate_image_text(
+        analysis_prompt,
+        image_bytes,
+        image.content_type,
+        max_output_tokens=1200,
     )
 
     analysis = analysis_response.output_text
@@ -1970,10 +1996,17 @@ Return ONLY valid JSON:
             prompt = prompt + "\n\nIDENTITY VALIDATION FAILED. You must regenerate the entire JSON. Fix these exact errors:\n- " + "\n- ".join(identity_errors) + "\nDo not change the target product, gemstone, or supported facts. Return ONLY valid JSON."
         except RuntimeError as exc:
             last_error = exc
-            # Rate-limit failures are deliberately not retried. Retrying a 429
-            # only burns more quota and makes the situation worse.
-            if "OpenAI API rate limit reached" in str(exc):
-                raise
+            # Gemini quota/rate-limit failures are deliberately not retried.
+            # Repeating a quota failure can make free-tier testing worse.
+            error_text = str(exc).lower()
+            if any(marker in error_text for marker in (
+                "429", "resource_exhausted", "rate limit", "quota", "too many requests"
+            )):
+                raise RuntimeError(
+                    "Gemini API free-tier rate/quota limit reached. "
+                    "Please wait for the limit to reset before trying again. "
+                    f"Original error: {exc}"
+                ) from exc
             prompt = prompt + "\n\nFINAL REMINDER: Return ONLY one compact JSON object. No markdown, no commentary, no code fences. Ensure all JSON strings escape newlines and quotes correctly."
         except Exception as exc:
             last_error = exc
