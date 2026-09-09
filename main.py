@@ -2306,10 +2306,23 @@ def extract_product_identity(listing):
     for gem in gemstones:
         if re.search(r"\b" + re.escape(gem) + r"\b", source_text):
             gemstone_terms.append(gem)
-    # Preserve the most specific gemstone phrases first and remove substrings.
-    gemstone_terms = sorted(set(gemstone_terms), key=lambda x: (-len(x.split()), -len(x)))
+    # Preserve the most specific gemstone phrases, but determine the primary
+    # gemstone by the order it appears in the source title/description rather
+    # than alphabetical/length sorting. This prevents a secondary stone such as
+    # "black spinel" from accidentally becoming the primary stone simply because
+    # it sorts ahead of "ethiopian opal".
+    unique_gemstones = list(dict.fromkeys(gemstone_terms))
+    def first_position(term):
+        m = re.search(r"\b" + re.escape(term) + r"\b", title.lower())
+        if m:
+            return (0, m.start())
+        m = re.search(r"\b" + re.escape(term) + r"\b", description.lower())
+        if m:
+            return (1, m.start())
+        return (2, len(source_text))
+    unique_gemstones.sort(key=lambda x: (first_position(x), -len(x.split()), -len(x)))
     filtered_gems = []
-    for gem in gemstone_terms:
+    for gem in unique_gemstones:
         if not any(gem != other and gem in other for other in filtered_gems):
             filtered_gems.append(gem)
 
