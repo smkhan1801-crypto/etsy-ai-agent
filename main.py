@@ -1355,12 +1355,12 @@ def validate_listing(candidate):
 
 
 def seo_score_report(current_listing, optimized_result, market_signals, validation_errors=None, identity=None):
-    """V5 evidence-aware deterministic SEO quality score.
+    """V6 evidence-aware deterministic SEO quality score.
 
     The score measures the quality of the optimizer output against observable
     Etsy/listing evidence. It is not Etsy's ranking score.
 
-    Important V5 rule:
+    Important V6 rule:
     A keyword is scoreable only when it is supported by source product facts
     or by the optimizer's marketplace-signal set. Missing/unavailable evidence
     is not turned into a fake failure merely to lower or raise the score.
@@ -1463,14 +1463,59 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         gr.append("Remove duplicate tags.")
 
-    relevant = sum(
-        1 for t in tag_norm
-        if any(p and (p in t or t in p) for p in protected)
-    )
+    # Evidence-aware relevance: source facts/listing language OR marketplace
+    # signals. This avoids the overly narrow "protected terms only" rule.
+    signal_phrases_for_tags = set()
+    def _collect_tag_signals(value):
+        if isinstance(value, str):
+            s = normalize_text(value)
+            if 1 <= len(s.split()) <= 8 and len(s) <= 80:
+                signal_phrases_for_tags.add(s)
+        elif isinstance(value, list):
+            for item in value:
+                _collect_tag_signals(item)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                if str(k).lower() not in {"score", "count", "rank", "id"}:
+                    _collect_tag_signals(v)
+    _collect_tag_signals(market_signals or {})
+
+    source_terms_for_tags = set(protected)
+    for value in [
+        product_type, primary_gem,
+        current_listing.get("title", ""),
+        current_listing.get("description", ""),
+        *(current_listing.get("tags", []) or []),
+        *(current_listing.get("materials", []) or []),
+        *(current_listing.get("style", []) or []),
+    ]:
+        s = normalize_text(str(value))
+        if s:
+            source_terms_for_tags.add(s)
+
+    identity_words_for_tags = set(re.findall(
+        r"[a-z0-9]+",
+        normalize_text(" ".join([product_type, primary_gem] + gems))
+    ))
+
+    def _tag_is_supported(tag):
+        if any(term and (tag in term or term in tag) for term in source_terms_for_tags):
+            return True
+        if tag in signal_phrases_for_tags:
+            return True
+        tag_words = set(re.findall(r"[a-z0-9]+", tag))
+        if not (tag_words & identity_words_for_tags):
+            return False
+        return any(
+            sig and len(tag_words & set(re.findall(r"[a-z0-9]+", sig))) >= 1
+            for sig in signal_phrases_for_tags
+        )
+
+    relevant = sum(1 for t in tag_norm if _tag_is_supported(t))
     if tags:
         gp += round(4 * relevant / len(tags))
     if tags and relevant < max(7, round(len(tags) * 0.55)):
-        gr.append("More tags should directly reinforce the source product.")
+        gr.append("More tags should be directly supported by source facts or marketplace signals.")
 
     starts = [t.split()[0] for t in tag_norm if t.split()]
     distinct_starts = len(set(starts))
@@ -1482,7 +1527,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
             gr.append("Use a broader mix of search-phrase structures.")
     gp = min(20, gp)
 
-    # ---------- V5 keyword evidence ----------
+    # ---------- V6 keyword evidence ----------
     # Gather marketplace phrases from whatever structure the existing research
     # helper returned. These are directional signals, not exact search volume.
     signal_phrases = set()
@@ -1747,7 +1792,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. V5 only scores keyword coverage "
+            "It is not Etsy's ranking score. V6 only scores keyword coverage "
             "against source/listing evidence or marketplace signals and never "
             "treats unavailable Etsy metadata as a failure."
         ),
@@ -2711,12 +2756,20 @@ def optimizer_page(listing_id: str = Query("")):
       <div class="card full">
         <div class="section-title"><h2>🧠 SEO Intelligence Breakdown</h2></div>
         <div class="breakdown">
+          <div class="break-row"><span>Product Identity</span><b id="identityBreak">—</b><small>/ 15</small></div>
+          <div class="bar"><i id="identityBar"></i></div>
           <div class="break-row"><span>Title</span><b id="titleBreak">—</b><small>/ 15</small></div>
           <div class="bar"><i id="titleBar"></i></div>
           <div class="break-row"><span>13 Tags</span><b id="tagsBreak">—</b><small>/ 20</small></div>
           <div class="bar"><i id="tagsBar"></i></div>
+          <div class="break-row"><span>Keyword Coverage</span><b id="keywordBreak">—</b><small>/ 15</small></div>
+          <div class="bar"><i id="keywordBar"></i></div>
           <div class="break-row"><span>Description</span><b id="descBreak">—</b><small>/ 15</small></div>
           <div class="bar"><i id="descBar"></i></div>
+          <div class="break-row"><span>Category &amp; Attributes</span><b id="attrBreak">—</b><small>/ —</small></div>
+          <div class="bar"><i id="attrBar"></i></div>
+          <div class="break-row"><span>Buyer Quality</span><b id="buyerBreak">—</b><small>/ 10</small></div>
+          <div class="bar"><i id="buyerBar"></i></div>
         </div>
         <p id="scoreBasis" class="muted">The breakdown shows how the optimizer scores measurable listing structure. It is not Etsy's internal ranking formula.</p>
       </div>
@@ -2772,7 +2825,14 @@ function render(data) {
   const gaps=sc.gaps||[]; $('scoreGaps').innerHTML=gaps.length ? '<b>Points still missing:</b> '+gaps.map(g=>`${g.section}: ${g.points_lost} — ${(g.reasons||[]).join('; ')}`).join(' | ') : '<span class="success"><b>100/100 — all applicable measurable checks passed.</b></span>';
   const bd=sc.breakdown||{};
   const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; if($(el)) $(el).textContent=(val ?? '—'); if($(bar)) $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
-  setBreak('title','titleBreak','titleBar'); setBreak('tags','tagsBreak','tagsBar'); setBreak('description','descBreak','descBar');
+  setBreak('product_identity','identityBreak','identityBar');
+  setBreak('title','titleBreak','titleBar');
+  setBreak('tags','tagsBreak','tagsBar');
+  setBreak('keyword_coverage','keywordBreak','keywordBar');
+  setBreak('description','descBreak','descBar');
+  setBreak('attributes','attrBreak','attrBar');
+  setBreak('buyer_quality','buyerBreak','buyerBar');
+  const attrMaxEl=document.querySelector('#attrBreak')?.parentElement?.querySelector('small'); if(attrMaxEl) attrMaxEl.textContent='/ '+((bd.attributes||{}).max ?? '—');
   $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const meta=document.createElement('span');meta.textContent=`${(item.type||'keyword').toUpperCase()} • ${(item.signal||'signal').toUpperCase()}`;const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(meta);d.appendChild(sp);$('keywords').appendChild(d);});
   const ki=o.keyword_intelligence||{};
   const renderPills=(id,items)=>{const el=$(id);el.innerHTML='';(items||[]).forEach(x=>{const s=document.createElement('span');s.className='tag';s.textContent=x;el.appendChild(s);});};
