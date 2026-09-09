@@ -289,6 +289,15 @@ def etsy_get(url, access_token=None, params=None):
     return response
 
 
+
+def etsy_patch_form(url, access_token, data):
+    response = requests.patch(url, headers=etsy_form_headers(access_token), data=data, timeout=30)
+    if response.status_code == 401:
+        refreshed = refresh_etsy_token()
+        if refreshed:
+            response = requests.patch(url, headers=etsy_form_headers(refreshed.get("access_token")), data=data, timeout=30)
+    return response
+
 # -------------------------------------------------------------------
 # OAUTH
 # -------------------------------------------------------------------
@@ -1796,7 +1805,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. V8 only scores keyword coverage "
+            "It is not Etsy's ranking score. V11 scores keyword coverage only "
             "against source/listing evidence or marketplace signals and never "
             "treats unavailable Etsy metadata as a failure."
         ),
@@ -2642,11 +2651,76 @@ Return ONLY valid JSON:
     result.pop("_keyword_gap_instruction", None)
     return result
 
+@app.post("/apply-optimized-listing")
+async def apply_optimized_listing(request: Request):
+    """Apply explicitly approved SEO fields to the user's own Etsy listing."""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON request.")
+    if not payload.get("confirm"):
+        raise HTTPException(status_code=400, detail="Update was not confirmed.")
+
+    listing_id = str(payload.get("listing_id") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    description = str(payload.get("description") or "")
+    tags = payload.get("tags")
+    expected_current_title = str(payload.get("expected_current_title") or "").strip()
+    if not listing_id.isdigit():
+        raise HTTPException(status_code=400, detail="A valid Etsy listing ID is required.")
+    if not title or len(title) > 140:
+        raise HTTPException(status_code=400, detail="Etsy listing title must be 1–140 characters.")
+    if not isinstance(tags, list) or len(tags) != 13:
+        raise HTTPException(status_code=400, detail="Exactly 13 Etsy tags are required.")
+    clean_tags = [str(x).strip() for x in tags]
+    if any(not x for x in clean_tags):
+        raise HTTPException(status_code=400, detail="Tags cannot be empty.")
+    if any(len(x) > 20 for x in clean_tags):
+        bad = next(x for x in clean_tags if len(x) > 20)
+        raise HTTPException(status_code=400, detail=f"Etsy tag exceeds 20 characters: {bad}")
+    if len({x.lower() for x in clean_tags}) != 13:
+        raise HTTPException(status_code=400, detail="All 13 tags must be unique.")
+    if not expected_current_title:
+        raise HTTPException(status_code=400, detail="The original listing title is required for the stale-change safety check.")
+
+    context = get_shop_context()
+    access_token = context["access_token"]
+    get_url = f"https://api.etsy.com/v3/application/listings/{listing_id}"
+    current_response = etsy_get(get_url, access_token, params={"language":"en", "legacy":"false"})
+    if not current_response.ok:
+        raise HTTPException(status_code=current_response.status_code, detail=current_response.text)
+    current = current_response.json()
+    if str(current.get("shop_id")) != str(context["shop_id"]):
+        raise HTTPException(status_code=403, detail="This listing does not belong to your connected Etsy shop.")
+    if str(current.get("title") or "").strip() != expected_current_title:
+        raise HTTPException(status_code=409, detail="This listing changed on Etsy after it was analyzed. Please analyze it again before applying the optimization.")
+
+    update_url = f"https://api.etsy.com/v3/application/shops/{context['shop_id']}/listings/{listing_id}"
+    form_data = [("title", title), ("description", description), ("tags", ",".join(clean_tags))]
+    update_response = etsy_patch_form(update_url, access_token, form_data)
+    if not update_response.ok:
+        raise HTTPException(status_code=update_response.status_code, detail={"message":"Etsy rejected the listing update.","etsy_response":update_response.text})
+
+    verify_response = etsy_get(get_url, access_token, params={"language":"en", "legacy":"false"})
+    verified = verify_response.json() if verify_response.ok else {}
+    verified_tags = [str(x).strip() for x in (verified.get("tags") or [])]
+    verification = {
+        "title_updated": str(verified.get("title") or "").strip() == title,
+        "description_updated": str(verified.get("description") or "") == description,
+        "tags_updated": [x.lower() for x in verified_tags] == [x.lower() for x in clean_tags],
+    }
+    verification["all_fields_verified"] = all(verification.values())
+    return {
+        "status":"updated" if verification["all_fields_verified"] else "updated_verification_warning",
+        "message": "Etsy listing updated successfully and all 3 SEO fields were verified." if verification["all_fields_verified"] else "Etsy accepted the update, but one or more fields could not be verified immediately. Check the listing again shortly.",
+        "listing_id":listing_id, "updated_fields":["title","tags","description"], "verification":verification
+    }
+
 @app.get("/optimizer", response_class=HTMLResponse)
 def optimizer_page(listing_id: str = Query("")):
     """Human-friendly UI for the existing Etsy listing SEO optimizer.
 
-    This page only calls /analyze-existing-listing. It never writes to Etsy.
+    This page analyzes an existing Etsy listing and can apply approved SEO fields after explicit confirmation.
     """
     response = HTMLResponse(r"""
 <!doctype html>
@@ -2654,7 +2728,7 @@ def optimizer_page(listing_id: str = Query("")):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer — V10</title>
+<title>Etsy AI SEO Optimizer — V11</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -2708,7 +2782,7 @@ def optimizer_page(listing_id: str = Query("")):
 <div class="wrap">
   <div class="hero">
     <h1>🚀 Etsy AI SEO Optimizer</h1>
-    <p class="sub">Analyze an existing Etsy listing and get a buyer-friendly title, 13 SEO tags, optimized description and keyword strategy. <b>Nothing is edited or published.</b></p>
+    <p class="sub">Analyze an existing Etsy listing and get a buyer-friendly title, 13 SEO tags, optimized description and keyword strategy. Review the changes, then apply them directly to Etsy.</p>
   </div>
   <div class="card">
     <form id="form">
@@ -2723,6 +2797,10 @@ def optimizer_page(listing_id: str = Query("")):
     <div class="card" style="text-align:center">
       <button type="button" id="copyAll" style="margin-top:0">📋 Copy All SEO Content</button>
       <p class="muted" style="margin:9px 0 0">Copies the optimized title, 13 tags and description together.</p>
+    </div>
+    <div class="card" style="text-align:center; border-color:#4b6cff">
+      <button type="button" id="applyToEtsy" style="margin-top:0; background:#55d98a; color:#06150b;">✅ Review &amp; Update Etsy Listing</button>
+      <p id="applyStatus" class="muted" style="margin:9px 0 0">Nothing will be changed until you click the button and confirm.</p>
     </div>
     <div class="card">
       <div class="section-title"><h2>🏷️ Recommended SEO Title</h2><button type="button" class="copy" data-copy="title">Copy</button></div>
@@ -2811,7 +2889,7 @@ def optimizer_page(listing_id: str = Query("")):
         <div class="meta">
           <div><strong>CURRENT TITLE</strong><span id="currentTitle"></span></div>
           <div><strong>LISTING ID</strong><span id="listingId"></span></div>
-          <div><strong>WRITE ACTION</strong><span class="success">Not performed</span></div>
+          <div><strong>WRITE ACTION</strong><span id="writeAction" class="success">Not performed</span></div>
         </div>
       </div>
     </div>
@@ -2855,9 +2933,22 @@ function render(data) {
   renderPills('primaryKeywords',ki.primary_keywords); renderPills('secondaryKeywords',ki.secondary_keywords); renderPills('longTailKeywords',ki.long_tail_keywords); renderPills('buyerIntentKeywords',ki.buyer_intent_keywords); renderPills('avoidKeywords',ki.avoid_keywords);
   $('result').classList.remove('hidden');
 }
-$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();const enteredUrl=$('listing_url').value.trim();fd.append('listing_url',enteredUrl);if(!enteredUrl && $('listing_id_hint').value)fd.append('listing_id',$('listing_id_hint').value);const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
+$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();const enteredUrl=$('listing_url').value.trim();fd.append('listing_url',enteredUrl);if(!enteredUrl && $('listing_id_hint').value)fd.append('listing_id',$('listing_id_hint').value);const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — ready for your review. Nothing has been changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
 document.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{const key=btn.dataset.copy;const value=key==='tags'?latest.tags.join(', '):latest[key];try{await navigator.clipboard.writeText(value||'');const old=btn.textContent;btn.textContent='Copied ✓';setTimeout(()=>btn.textContent=old,1200);}catch(_){btn.textContent='Copy failed';}}));
 $('copyAll').addEventListener('click',async()=>{const text=`TITLE\n${latest.title}\n\n13 TAGS\n${latest.tags.map((x,i)=>`${i+1}. ${x}`).join('\n')}\n\nDESCRIPTION\n${latest.description}`;try{await navigator.clipboard.writeText(text);const b=$('copyAll');b.textContent='Copied ✓';setTimeout(()=>b.textContent='📋 Copy All SEO Content',1400);}catch(_){$('copyAll').textContent='Copy failed';}});
+$('applyToEtsy').addEventListener('click',async()=>{
+  const listingId=$('listingId').textContent.trim(), currentTitle=$('compareCurrentTitle').textContent.trim();
+  if(!listingId){$('applyStatus').className='error';$('applyStatus').textContent='No listing ID is available.';return;}
+  if(!window.confirm('Update this Etsy listing now?\n\nOnly the title, 13 tags and description will be changed.')){ $('applyStatus').textContent='Update cancelled. Nothing was changed on Etsy.'; return; }
+  const btn=$('applyToEtsy'); btn.disabled=true; $('applyStatus').className='muted'; $('applyStatus').textContent='Updating Etsy listing and verifying the changes…';
+  try{
+    const r=await fetch('/apply-optimized-listing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true,listing_id:listingId,title:latest.title,tags:latest.tags,description:latest.description,expected_current_title:currentTitle})});
+    const raw=await r.text(); let data; try{data=raw?JSON.parse(raw):{};}catch(_){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}
+    if(!r.ok) throw new Error(data.detail?.message||data.detail||`Update failed (HTTP ${r.status})`);
+    $('applyStatus').className=data.status==='updated'?'success':'warn'; $('applyStatus').textContent=data.message||'Etsy listing update completed.';
+    $('writeAction').textContent=data.status==='updated'?'Updated & verified ✓':'Updated — verify shortly'; $('writeAction').className=data.status==='updated'?'success':'warn'; btn.textContent='✅ Etsy Listing Updated';
+  }catch(err){$('applyStatus').className='error';$('applyStatus').textContent=err.message||'Update failed.';}finally{btn.disabled=false;}
+});
 </script>
 </body>
 </html>
