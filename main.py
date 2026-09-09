@@ -35,6 +35,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_FALLBACK_MODELS = [
+    m.strip() for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.5-flash,gemini-3.1-flash-lite"
+    ).split(",") if m.strip()
+]
 
 _gemini_client = None
 
@@ -53,32 +59,70 @@ class GeminiTextResponse:
     def __init__(self, text):
         self.output_text = text or ""
 
+def _gemini_models_to_try():
+    # Try the configured model first, then free-tier Flash fallbacks.
+    seen = set()
+    models = []
+    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+        if model and model not in seen:
+            seen.add(model)
+            models.append(model)
+    return models
+
+def _is_gemini_transient_error(exc):
+    msg = str(exc).lower()
+    return any(token in msg for token in [
+        "503", "unavailable", "high demand", "429",
+        "resource exhausted", "500", "502", "504", "temporarily"
+    ])
+
+def _gemini_generate_with_fallback(contents, config, purpose="text"):
+    last_exc = None
+    models = _gemini_models_to_try()
+    for model_index, model in enumerate(models):
+        # One short retry for a transient failure, then move to the next model.
+        for attempt in range(2):
+            try:
+                response = get_gemini_client().models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+                text = getattr(response, "text", None) or ""
+                if not text:
+                    raise RuntimeError(f"Gemini returned an empty {purpose} response.")
+                return GeminiTextResponse(text)
+            except Exception as exc:
+                last_exc = exc
+                if not _is_gemini_transient_error(exc):
+                    raise
+                # Small exponential backoff for 503/429/5xx.
+                if attempt == 0:
+                    time.sleep(1.5)
+        # If the configured model is busy, continue to the next free-tier model.
+
+    raise RuntimeError(
+        "Gemini is temporarily unavailable on all configured models. "
+        f"Tried: {', '.join(models)}. Last error: {type(last_exc).__name__}: {last_exc}"
+    )
+
 def gemini_generate_text(prompt, max_output_tokens=3000, json_mode=False):
     config_kwargs = {"max_output_tokens": max_output_tokens}
     if json_mode:
         config_kwargs["response_mime_type"] = "application/json"
-
-    response = get_gemini_client().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(**config_kwargs),
+    return _gemini_generate_with_fallback(
+        prompt,
+        types.GenerateContentConfig(**config_kwargs),
+        purpose="text",
     )
-    text = getattr(response, "text", None) or ""
-    if not text:
-        raise RuntimeError("Gemini returned an empty response.")
-    return GeminiTextResponse(text)
 
 def gemini_generate_image_text(prompt, image_bytes, mime_type, max_output_tokens=1200):
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-    response = get_gemini_client().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt, image_part],
-        config=types.GenerateContentConfig(max_output_tokens=max_output_tokens),
+    return _gemini_generate_with_fallback(
+        [prompt, image_part],
+        types.GenerateContentConfig(max_output_tokens=max_output_tokens),
+        purpose="image-analysis",
     )
-    text = getattr(response, "text", None) or ""
-    if not text:
-        raise RuntimeError("Gemini returned an empty image-analysis response.")
-    return GeminiTextResponse(text)
 
 ETSY_KEYSTRING = os.getenv("ETSY_API_KEYSTRING")
 ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET")
@@ -129,6 +173,7 @@ def home():
         "docs": "/docs",
         "ai_backend": "Google Gemini Free Tier",
         "ai_model": GEMINI_MODEL,
+        "ai_fallback_models": GEMINI_FALLBACK_MODELS,
     }
 
 
