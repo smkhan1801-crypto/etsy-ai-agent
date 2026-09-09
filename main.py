@@ -2377,9 +2377,21 @@ def validate_product_identity(optimized, identity):
 
     if gemstones:
         primary_gem = gemstones[0]
-        if not re.search(r"\b" + re.escape(primary_gem) + r"\b", title.lower()):
+
+        # Multi-word gemstone names can be expressed with harmless intervening
+        # words (for example, "Ethiopian natural opal"). Treat the gemstone as
+        # preserved when all meaningful words are present, while still rejecting
+        # a true substitution such as opal -> emerald.
+        def gemstone_present(text, phrase):
+            text_l = text.lower()
+            if re.search(r"\b" + re.escape(phrase) + r"\b", text_l):
+                return True
+            words = [w for w in re.findall(r"[a-z0-9]+", phrase.lower()) if len(w) > 2]
+            return len(words) > 1 and all(re.search(r"\b" + re.escape(w) + r"\b", text_l) for w in words)
+
+        if not gemstone_present(title, primary_gem):
             errors.append(f"Gemstone drift: optimized title must retain the target gemstone '{primary_gem}'.")
-        if not re.search(r"\b" + re.escape(primary_gem) + r"\b", description.lower()):
+        if not gemstone_present(description, primary_gem):
             errors.append(f"Gemstone drift: optimized description must retain the target gemstone '{primary_gem}'.")
 
         # If the source clearly identifies a second gemstone (e.g. black spinel),
