@@ -1355,13 +1355,12 @@ def validate_listing(candidate):
 
 
 def seo_score_report(current_listing, optimized_result, market_signals, validation_errors=None, identity=None):
-    """Evidence-aware deterministic SEO quality score; NOT Etsy's ranking score.
+    """V4 evidence-aware deterministic SEO quality score.
 
-    v2 scores only checks that can actually be evaluated from the source listing
-    and Etsy API response. If Etsy does not expose a particular attribute field,
-    that criterion is excluded from the denominator instead of being treated as
-    a failure. A genuine 100/100 therefore means every applicable measurable
-    check passed.
+    This is an internal quality rubric, not Etsy's ranking score.
+    Every point is tied to an observable condition. Unavailable Etsy metadata
+    is excluded rather than treated as a failure. Hard identity/format errors
+    are reported separately so they are not double-counted in buyer quality.
     """
     validation_errors = validation_errors or []
     identity = identity or extract_product_identity(current_listing)
@@ -1377,96 +1376,118 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     dn = normalize_text(description)
     alln = " ".join([tn] + tag_norm + [dn])
 
-    product_type = identity.get("product_type", "")
+    product_type = identity.get("product_type", "") or ""
     gems = identity.get("gemstones", []) or []
     primary_gem = gems[0] if gems else ""
+    protected = [normalize_text(x) for x in identity.get("protected_terms", []) if x]
 
-    # 1. Product identity = 15
+    def has_term(text_norm, term):
+        term = normalize_text(term or "")
+        return bool(term and (re.search(r"\b" + re.escape(term) + r"\b", text_norm) or term in text_norm))
+
+    # ---------------- Product identity: 15 ----------------
     ip, ir = 0, []
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn):
+    if not product_type or has_term(tn, product_type):
         ip += 5
     else:
-        ir.append("Target product type is missing from the optimized title.")
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", dn):
+        ir.append("Target product type is missing from the title.")
+    if not product_type or has_term(dn, product_type):
         ip += 3
     else:
         ir.append("Target product type is missing from the description.")
-    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", tn):
+    if not primary_gem or has_term(tn, primary_gem):
         ip += 4
     else:
         ir.append("Primary gemstone is missing from the title.")
-    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", dn):
+    if not primary_gem or has_term(dn, primary_gem):
         ip += 3
     else:
         ir.append("Primary gemstone is missing from the description.")
 
-    # 2. Title = 15
+    # ---------------- Title: 15 ----------------
     tp, tr = 0, []
     if title:
         tp += 3
     else:
         tr.append("Title is empty.")
+
+    # Etsy's current guidance favors concise titles; 8–15 is a quality target,
+    # not a cliff at 13. Any 8–15 word title receives full word-count credit.
     if 8 <= len(tw) <= 15:
         tp += 3
-    elif 5 <= len(tw) <= 17:
+    elif 6 <= len(tw) <= 17:
         tp += 1
-        tr.append("Aim for roughly 8–15 readable words.")
+        tr.append(f"Title has {len(tw)} words; target 8–15.")
     else:
-        tr.append("Aim for roughly 8–15 readable words.")
+        tr.append(f"Title has {len(tw)} words; target 8–15.")
+
     if len(title) <= 140:
         tp += 2
     else:
         tr.append("Title exceeds 140 characters.")
+
     if tw and len(tw) == len(set(tw)):
         tp += 3
     else:
-        tr.append("Title repeats words.")
+        tr.append("Title repeats one or more words.")
+
     subjective = {"best","perfect","beautiful","unique","amazing","stunning","gorgeous","must","premium","luxury"}
-    if not subjective.intersection(tw):
+    if not subjective.intersection(set(tw)):
         tp += 2
     else:
         tr.append("Remove subjective sales language from the title.")
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn[:max(1, min(len(tn), 80))]):
+
+    if not product_type or has_term(tn[:max(1, min(len(tn), 90))], product_type):
         tp += 2
     else:
-        tr.append("Put the actual product type near the beginning.")
+        tr.append("Place the actual product type near the beginning.")
 
-    # 3. Tags = 20
+    # ---------------- Tags: 20 ----------------
     gp, gr = 0, []
+
     if len(tags) == 13:
         gp += 4
     else:
-        gr.append("Exactly 13 tags are required.")
+        gr.append(f"Use exactly 13 tags; current count is {len(tags)}.")
+
     if tags:
         valid_len = sum(len(t) <= 20 for t in tags)
         gp += round(4 * valid_len / len(tags))
         if valid_len < len(tags):
             gr.append("Every tag must be 20 characters or fewer.")
-    unique_ratio = len(set(tag_norm)) / max(1, len(tag_norm))
-    gp += round(4 * unique_ratio)
-    if unique_ratio < 1:
-        gr.append("Remove duplicate tags.")
-    protected = [normalize_text(x) for x in identity.get("protected_terms", []) if x]
-    relevant = sum(1 for t in tag_norm if any(p and (p in t or t in p) for p in protected))
-    gp += round(4 * relevant / max(1, len(tags)))
-    if tags and relevant / len(tags) < 0.5:
-        gr.append("More tags should directly reinforce the actual product.")
-    # Diversity should measure actual tag phrases, not unfairly penalize
-    # legitimate phrases that share a core word such as "opal" or "necklace".
-    # Full diversity credit is available when all tags are unique and there are
-    # at least 8 distinct meaningful starting tokens across 13 tags.
-    first_words = [t.split()[0] for t in tag_norm if t.split()]
-    distinct_first = len(set(first_words))
-    diversity_ratio = distinct_first / max(1, len(first_words))
-    if len(tags) == 13 and unique_ratio == 1 and distinct_first >= 8:
+
+    unique_count = len(set(tag_norm))
+    unique_ratio = unique_count / max(1, len(tag_norm))
+    if unique_ratio == 1:
         gp += 4
     else:
-        gp += round(4 * min(1, diversity_ratio))
-        if distinct_first < 8:
-            gr.append("Use a broader mix of tag phrase structures.")
+        gr.append("Remove duplicate tags.")
+
+    # Product relevance: tag must contain or be contained by at least one
+    # protected product/gemstone term. This is deliberately conservative.
+    relevant = sum(
+        1 for t in tag_norm
+        if any(p and (p in t or t in p) for p in protected)
+    )
+    if tags:
+        gp += round(4 * relevant / len(tags))
+    if tags and relevant < max(7, round(len(tags) * 0.55)):
+        gr.append("More tags should directly reinforce the source product.")
+
+    # Phrase-structure diversity: shared core terms are allowed. We only flag
+    # near-identical phrase structures.
+    distinct_phrases = len(set(tag_norm))
+    starts = [t.split()[0] for t in tag_norm if t.split()]
+    distinct_starts = len(set(starts))
+    if distinct_phrases == len(tags) and distinct_starts >= min(8, len(tags)):
+        gp += 4
+    else:
+        gp += round(4 * min(1, distinct_starts / max(1, len(tags))))
+        if distinct_starts < min(8, len(tags)):
+            gr.append("Use a broader mix of search-phrase structures.")
     gp = min(20, gp)
 
-    # 4. Keyword coverage = 15
+    # ---------------- Keyword coverage: 15 ----------------
     kp, kr = 0, []
     groups = [
         ("primary_keywords", 6, 5),
@@ -1476,53 +1497,63 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     ]
     for key, pts, take in groups:
         vals = [normalize_text(x) for x in ki.get(key, []) if str(x).strip()]
+        vals = list(dict.fromkeys(vals))
         if vals:
-            covered = sum(1 for k in vals[:take] if k and k in alln)
-            kp += round(pts * covered / min(take, len(vals)))
-            if covered < min(take, len(vals)):
+            considered = vals[:take]
+            covered = sum(1 for k in considered if k and k in alln)
+            kp += round(pts * covered / len(considered))
+            if covered < len(considered):
                 kr.append(f"Some {key.replace('_',' ')} are not covered by the listing copy.")
         else:
+            # The model may legitimately have no buyer-intent phrase. Do not
+            # manufacture a keyword just to earn points; record it as a gap.
             kr.append(f"No {key.replace('_',' ')} were returned.")
     kp = min(15, kp)
-    if kp < 12:
-        kr.append("Important keyword groups are not sufficiently covered by the listing copy.")
 
-    # 5. Description = 15
+    # ---------------- Description: 15 ----------------
     dp, dr = 0, []
     if description:
         dp += 3
     else:
         dr.append("Description is empty.")
+
     first = re.split(r"(?<=[.!?])\s+", description, maxsplit=1)[0] if description else ""
     fn = normalize_text(first)
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", fn):
+
+    if not product_type or has_term(fn, product_type):
         dp += 3
     else:
         dr.append("First sentence should clearly identify the product.")
-    if not primary_gem or primary_gem in fn:
+
+    if not primary_gem or has_term(fn, primary_gem):
         dp += 3
     else:
         dr.append("First sentence should include the primary gemstone.")
+
     if len(description) >= 250:
         dp += 2
     elif len(description) >= 120:
         dp += 1
-        dr.append("Description can be expanded with supported buyer information.")
+        dr.append("Description could include more supported buyer information.")
     else:
         dr.append("Description is too short.")
+
     detail_terms = ["material","size","stone","gemstone","design","wear","care","shipping","gift"]
-    dp += min(2, sum(1 for x in detail_terms if re.search(r"\b"+x+r"\b", dn)) // 2)
-    if not subjective.intersection(words(description)):
+    detail_hits = sum(1 for x in detail_terms if re.search(r"\b" + re.escape(x) + r"\b", dn))
+    dp += min(2, detail_hits // 2)
+
+    if not subjective.intersection(set(words(description))):
         dp += 1
     else:
         dr.append("Avoid excessive subjective sales language.")
+
     if len(description.split()) >= 80:
         dp += 3
     else:
         dr.append("Add useful buyer information where the source listing supports it.")
     dp = min(15, dp)
 
-    # 6. Category & attributes = 10, evidence-aware.
+    # ---------------- Category / attributes: 10 ----------------
     attrs = current_listing.get("attributes", []) or []
     taxonomy_id = current_listing.get("taxonomy_id")
     taxonomy_properties = current_listing.get("taxonomy_properties", []) or []
@@ -1536,7 +1567,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     else:
         apr.append("Category/taxonomy is not confirmed.")
 
-    if isinstance(attrs, list) and len(attrs) > 0:
+    if isinstance(attrs, list) and attrs:
         if len(attrs) >= 4:
             ap_earned += 4
         elif len(attrs) >= 2:
@@ -1545,21 +1576,15 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         else:
             apr.append("Only limited source attributes are available.")
     else:
-        # Generic selected attributes are not exposed in this listing payload.
-        # Do not pretend this means the listing is bad.
         excluded_attribute_points += 4
         apr.append("Selected Etsy attribute values were not exposed in the listing payload; not scored as a failure.")
 
     if taxonomy_properties:
-        supports_attrs = sum(
-            1 for p in taxonomy_properties
-            if isinstance(p, dict) and p.get("supports_attributes")
-        )
-        if supports_attrs:
+        if any(isinstance(p, dict) and p.get("supports_attributes") for p in taxonomy_properties):
             ap_earned += 2
         else:
             excluded_attribute_points += 2
-            apr.append("Taxonomy schema exposes no attribute-capable properties for this category.")
+            apr.append("Taxonomy schema does not expose attribute-capable properties for this category.")
     else:
         excluded_attribute_points += 2
         apr.append("Taxonomy property schema could not be read; not scored as a failure.")
@@ -1567,78 +1592,90 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     ap_max_applicable = max(1, 10 - excluded_attribute_points)
     ap = min(ap_max_applicable, ap_earned)
 
-    # 7. Buyer/conversion quality = 10
+    # ---------------- Buyer/conversion quality: 10 ----------------
+    # IMPORTANT: validation_errors are shown separately and are NOT deducted
+    # here, preventing double-counting a technical/identity error.
     bp, br = 0, []
+
     if len(description) >= 250:
         bp += 3
     elif len(description) >= 120:
         bp += 2
+    else:
+        br.append("Description needs more useful buyer information.")
+
     if re.search(r"\b(size|dimension|length|mm|inch|inches)\b", dn):
         bp += 2
     else:
         br.append("Add known size/dimensions if the source listing provides them.")
+
     if re.search(r"\b(material|sterling|gold|silver|vermeil|gemstone|opal|spinel)\b", dn):
         bp += 2
     else:
         br.append("Make supported material/gemstone information easy to find.")
-    # Gifting language is optional. A listing should not lose a deterministic
-    # SEO point merely because the seller is not targeting gifts.
+
+    # One point for useful context, but never require the word "gift".
     if re.search(r"\b(gift|birthday|anniversary|wedding|holiday|present|everyday|occasion|wear)\b", dn):
         bp += 1
     else:
+        # Neutral conversion point: the absence of gift language is not a failure.
         bp += 1
+
     if not re.search(r"\b(heal|healing|cure|treat|medical)\b", alln):
         bp += 1
     else:
         br.append("Remove medical/healing claims.")
-    if not validation_errors:
+
+    # Final point = buyer clarity, not technical validation.
+    if product_type and primary_gem and has_term(fn, product_type) and has_term(fn, primary_gem):
         bp += 1
     else:
-        br.append("Resolve hard validation errors.")
+        br.append("Keep the opening sentence specific about the product and gemstone.")
     bp = min(10, bp)
 
-    fixed_sections = [
+    sections = [
         ("Product identity", ip, 15, ir),
         ("Title", tp, 15, tr),
         ("13 tags", gp, 20, gr),
         ("Keyword coverage", kp, 15, kr),
         ("Description", dp, 15, dr),
+        ("Category & attributes", ap, ap_max_applicable, apr),
         ("Buyer/conversion quality", bp, 10, br),
     ]
-    raw_earned = sum(s for _, s, _, _ in fixed_sections) + ap
-    raw_max = sum(m for _, _, m, _ in fixed_sections) + ap_max_applicable
-    normalized_total = round((raw_earned / raw_max) * 100) if raw_max else 0
-    normalized_total = max(0, min(100, normalized_total))
 
-    sections = fixed_sections + [("Category & attributes", ap, ap_max_applicable, apr)]
+    raw_earned = sum(s for _, s, _, _ in sections)
+    raw_max = sum(m for _, _, m, _ in sections)
+    score = round((raw_earned / raw_max) * 100) if raw_max else 0
+    score = max(0, min(100, score))
+
     gaps = [
         {
-            "section": n,
-            "score": s,
-            "max": m,
-            "points_lost": m - s,
-            "reasons": rs[:5],
+            "section": name,
+            "score": earned,
+            "max": maximum,
+            "points_lost": maximum - earned,
+            "reasons": reasons[:5],
         }
-        for n, s, m, rs in sections
-        if s < m
+        for name, earned, maximum, reasons in sections
+        if earned < maximum
     ]
 
     return {
         "current_score": None,
-        "optimized_score": normalized_total,
+        "optimized_score": score,
         "raw_points": raw_earned,
         "raw_max": raw_max,
         "applicable_points": raw_max,
         "excluded_points": 10 - ap_max_applicable,
         "grade": (
-            "A+" if normalized_total == 100
-            else "A" if normalized_total >= 90
-            else "B" if normalized_total >= 80
-            else "C" if normalized_total >= 70
-            else "D" if normalized_total >= 60
-            else "E"
+            "A+" if score == 100 else
+            "A" if score >= 90 else
+            "B" if score >= 80 else
+            "C" if score >= 70 else
+            "D" if score >= 60 else "E"
         ),
-        "is_genuine_100": normalized_total == 100,
+        "is_genuine_100": score == 100 and not validation_errors,
+        "hard_validation_errors": validation_errors[:10],
         "breakdown": {
             "product_identity": {"optimized": ip, "max": 15},
             "title": {"optimized": tp, "max": 15},
@@ -1656,8 +1693,8 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. v2 excludes unavailable Etsy attribute "
-            "fields from the denominator instead of treating unavailable data as a failure."
+            "It is not Etsy's ranking score. V4 does not deduct unavailable Etsy "
+            "metadata and does not double-count hard validation errors."
         ),
     }
 
@@ -2441,6 +2478,14 @@ MARKETPLACE SIGNALS:
 
 Fix the listed gaps without inventing facts.
 
+You must optimize toward every applicable deterministic check.
+Do not weaken, remove, or bypass a validation rule to increase the score.
+Do not add the word "gift" merely for scoring.
+Do not add unsupported attributes, measurements, materials, gemstone names,
+styles, occasions, or claims.
+If a gap is caused by a missing source fact, leave that fact out and explain it
+rather than fabricating it.
+
 Optimization priority:
 1. Fix tag quality and relevance gaps first.
 2. Fix keyword coverage gaps with truthful phrases supported by the source.
@@ -2666,7 +2711,7 @@ function render(data) {
   $('compareCurrentTitle').textContent=data.current_listing?.title||''; $('compareOptimizedTitle').textContent=latest.title||'';
   const curTags=data.current_listing?.tags||[]; $('compareCurrentTags').innerHTML=''; curTags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareCurrentTags').appendChild(s);});
   $('compareOptimizedTags').innerHTML=''; latest.tags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareOptimizedTags').appendChild(s);});
-  const sc=data.seo_score||{}; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('scoreStatus').textContent=sc.is_genuine_100?'100/100 ✓':'Needs improvement'; $('improvementRounds').textContent=sc.improvement_rounds ?? '—'; $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
+  const sc=data.seo_score||{}; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('scoreStatus').textContent=sc.is_genuine_100?'100/100 ✓':((sc.hard_validation_errors||[]).length?'Needs validation fix':'Needs improvement'); $('improvementRounds').textContent=sc.improvement_rounds ?? '—'; $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
   const excluded=sc.excluded_points||0; const rawMax=sc.raw_max||sc.applicable_points||100; const rawPts=sc.raw_points;
   $('scoreBasis').textContent=excluded ? `Evidence-aware score: ${rawPts ?? '—'}/${rawMax} applicable points. ${excluded} point(s) excluded because Etsy did not expose those fields in this listing payload.` : `Evidence-aware score: ${rawPts ?? '—'}/${rawMax} measurable points.`;
   const gaps=sc.gaps||[]; $('scoreGaps').innerHTML=gaps.length ? '<b>Points still missing:</b> '+gaps.map(g=>`${g.section}: ${g.points_lost} — ${(g.reasons||[]).join('; ')}`).join(' | ') : '<span class="success"><b>100/100 — all applicable measurable checks passed.</b></span>';
