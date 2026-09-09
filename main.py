@@ -2632,13 +2632,13 @@ def optimizer_page(listing_id: str = Query("")):
 
     This page only calls /analyze-existing-listing. It never writes to Etsy.
     """
-    return HTMLResponse(r"""
+    response = HTMLResponse(r"""
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer</title>
+<title>Etsy AI SEO Optimizer — V7</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -2846,6 +2846,10 @@ $('copyAll').addEventListener('click',async()=>{const text=`TITLE\n${latest.titl
 </body>
 </html>
 """)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 @app.post("/analyze-existing-listing")
 async def analyze_existing_listing(
