@@ -34,7 +34,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 _gemini_client = None
 
@@ -1852,7 +1852,17 @@ def validate_product_identity(optimized, identity):
             "topaz", "amethyst", "garnet", "pearl", "onyx", "moonstone", "turquoise",
         ]
         for other in unrelated_gems:
-            if other in source_gems:
+            # Allow generic gemstone words that are already part of a more
+            # specific source gemstone phrase. For example, a listing whose
+            # source contains "black spinel" and "fire opal" may legitimately
+            # use both "spinel" and "opal". The old validator incorrectly
+            # flagged those base words as unrelated gemstones.
+            if other in source_gems or any(
+                other == source_gem
+                or re.search(r"\b" + re.escape(other) + r"\b", source_gem)
+                or re.search(r"\b" + re.escape(source_gem) + r"\b", other)
+                for source_gem in source_gems
+            ):
                 continue
             count = len(re.findall(r"\b" + re.escape(other) + r"\b", all_text))
             if count >= 2:
