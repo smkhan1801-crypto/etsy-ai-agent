@@ -1780,7 +1780,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "applicable_points": raw_max,
         "excluded_points": 10 - ap_max_applicable,
         "grade": (
-            "A+" if score == 100 else
+            "A+" if score >= 95 else
             "A" if score >= 90 else
             "B" if score >= 80 else
             "C" if score >= 70 else
