@@ -1680,7 +1680,141 @@ def marketplace_keyword_signals(queries, per_query=15):
     }
 
 
+def extract_product_identity(listing):
+    """Build a deterministic identity lock from the target listing.
+
+    This is the source-of-truth layer for the optimizer. Marketplace competitors
+    may influence keyword language, but they are never allowed to redefine what
+    the target product is.
+    """
+    title = normalize_text(listing.get("title", ""))
+    tags = [normalize_text(x) for x in (listing.get("tags", []) or []) if str(x).strip()]
+    description = normalize_text(listing.get("description", ""))
+    materials = [normalize_text(x) for x in (listing.get("materials", []) or []) if str(x).strip()]
+    source_text = " ".join([title] + tags + [description] + materials).lower()
+
+    product_types = [
+        ("necklace", ["necklace", "necklaces", "choker"]),
+        ("bracelet", ["bracelet", "bracelets", "bangle"]),
+        ("ring", ["ring", "rings"]),
+        ("earring", ["earring", "earrings", "stud", "hoop earrings"]),
+        ("pendant", ["pendant", "pendants"]),
+        ("anklet", ["anklet", "anklets"]),
+    ]
+    product_type = ""
+    for canonical, variants in product_types:
+        if any(re.search(r"\b" + re.escape(v) + r"\b", source_text) for v in variants):
+            product_type = canonical
+            break
+
+    gemstones = [
+        "black spinel", "fire opal", "white opal", "rainbow opal", "ethiopian opal",
+        "blue sapphire", "yellow sapphire", "pink sapphire", "green sapphire",
+        "blue topaz", "smoky quartz", "rose quartz", "moonstone", "tourmaline",
+        "amethyst", "aquamarine", "garnet", "ruby", "emerald", "opal", "coral",
+        "onyx", "peridot", "citrine", "topaz", "lapis lazuli", "turquoise",
+        "peridot", "spinel", "sapphire", "diamond", "pearl",
+    ]
+    gemstone_terms = []
+    for gem in gemstones:
+        if re.search(r"\b" + re.escape(gem) + r"\b", source_text):
+            gemstone_terms.append(gem)
+    # Preserve the most specific gemstone phrases first and remove substrings.
+    gemstone_terms = sorted(set(gemstone_terms), key=lambda x: (-len(x.split()), -len(x)))
+    filtered_gems = []
+    for gem in gemstone_terms:
+        if not any(gem != other and gem in other for other in filtered_gems):
+            filtered_gems.append(gem)
+
+    protected_terms = []
+    for term in [product_type] + filtered_gems[:3]:
+        if term:
+            protected_terms.append(term)
+
+    # Add explicit objective material/purity terms only when they are actually
+    # present in the source listing.
+    objective_patterns = [
+        r"\b925 sterling silver\b", r"\bsterling silver\b", r"\b18k gold vermeil\b",
+        r"\b14k gold vermeil\b", r"\b10k gold\b", r"\b14k gold\b", r"\b18k gold\b",
+        r"\b24k gold\b", r"\bgold vermeil\b", r"\bgold plated\b",
+    ]
+    for pattern in objective_patterns:
+        m = re.search(pattern, source_text)
+        if m:
+            term = m.group(0)
+            if term not in protected_terms:
+                protected_terms.append(term)
+
+    return {
+        "product_type": product_type,
+        "gemstones": filtered_gems[:5],
+        "protected_terms": protected_terms,
+        "source_title": listing.get("title", ""),
+        "source_tags": tags,
+    }
+
+
+def validate_product_identity(optimized, identity):
+    """Reject an AI result that drifts into another jewelry product."""
+    errors = []
+    title = normalize_text(optimized.get("recommended_title", ""))
+    tags = [normalize_text(x) for x in (optimized.get("recommended_tags", []) or [])]
+    description = normalize_text(optimized.get("recommended_description", ""))
+    all_text = " ".join([title] + tags + [description]).lower()
+
+    product_type = identity.get("product_type", "")
+    gemstones = identity.get("gemstones", []) or []
+
+    if product_type:
+        if not re.search(r"\b" + re.escape(product_type) + r"s?\b", title.lower()):
+            errors.append(f"Product type drift: optimized title must contain the target product type '{product_type}'.")
+        if not re.search(r"\b" + re.escape(product_type) + r"s?\b", description.lower()):
+            errors.append(f"Product type drift: optimized description must describe the target product type '{product_type}'.")
+
+        conflicting = {
+            "necklace": ["ring", "bracelet", "earring", "pendant", "anklet"],
+            "bracelet": ["ring", "necklace", "earring", "pendant", "anklet"],
+            "ring": ["necklace", "bracelet", "earring", "pendant", "anklet"],
+            "earring": ["ring", "necklace", "bracelet", "pendant", "anklet"],
+            "pendant": ["ring", "necklace", "bracelet", "earring", "anklet"],
+            "anklet": ["ring", "necklace", "bracelet", "earring", "pendant"],
+        }.get(product_type, [])
+        for conflict in conflicting:
+            if re.search(r"\b" + re.escape(conflict) + r"s?\b", title.lower()):
+                errors.append(f"Product type drift: title contains conflicting product type '{conflict}'.")
+            # A conflicting type appearing repeatedly in the complete output is
+            # also treated as drift, while a single incidental word is tolerated.
+            count = len(re.findall(r"\b" + re.escape(conflict) + r"s?\b", all_text))
+            if count >= 2:
+                errors.append(f"Product type drift: output repeatedly uses conflicting product type '{conflict}'.")
+
+    if gemstones:
+        primary_gem = gemstones[0]
+        if not re.search(r"\b" + re.escape(primary_gem) + r"\b", title.lower()):
+            errors.append(f"Gemstone drift: optimized title must retain the target gemstone '{primary_gem}'.")
+        if not re.search(r"\b" + re.escape(primary_gem) + r"\b", description.lower()):
+            errors.append(f"Gemstone drift: optimized description must retain the target gemstone '{primary_gem}'.")
+
+        # If the source clearly identifies a second gemstone (e.g. black spinel),
+        # it is useful but not mandatory in the title. It must not be replaced by
+        # an unrelated gemstone.
+        source_gems = set(gemstones)
+        unrelated_gems = [
+            "coral", "ruby", "emerald", "sapphire", "opal", "spinel", "tourmaline",
+            "topaz", "amethyst", "garnet", "pearl", "onyx", "moonstone", "turquoise",
+        ]
+        for other in unrelated_gems:
+            if other in source_gems:
+                continue
+            count = len(re.findall(r"\b" + re.escape(other) + r"\b", all_text))
+            if count >= 2:
+                errors.append(f"Gemstone drift: output repeatedly introduces unrelated gemstone '{other}'.")
+
+    return list(dict.fromkeys(errors))
+
+
 def optimize_existing_listing(listing, market_signals):
+    identity = extract_product_identity(listing)
     current = {
         "title": listing.get("title", ""),
         "tags": listing.get("tags", []) or [],
@@ -1697,6 +1831,9 @@ random generic listing.
 CURRENT ETSY LISTING:
 {json.dumps(current, ensure_ascii=False)}
 
+NON-NEGOTIABLE PRODUCT IDENTITY (SOURCE OF TRUTH):
+{json.dumps(identity, ensure_ascii=False)}
+
 MARKETPLACE RESEARCH SIGNALS:
 {json.dumps(market_signals, ensure_ascii=False)}
 
@@ -1711,6 +1848,14 @@ INTERPRETATION:
 - Long-tail keywords should be specific multi-word phrases a buyer could realistically search.
 - Buyer-intent keywords should reflect gifting or purchase intent only when appropriate.
 - Avoid keywords that are irrelevant, unsupported by the listing, misleading, overly generic, or likely to create false expectations.
+
+PRODUCT IDENTITY LOCK — ABSOLUTE RULES:
+- The CURRENT ETSY LISTING and NON-NEGOTIABLE PRODUCT IDENTITY are the only source of truth for what the product is.
+- Marketplace research is ONLY for search-language evidence. Competitor products, gemstones, product types, materials, origins, sizes, and styles must NEVER be copied into this listing unless they are explicitly present in the current listing.
+- If the target is a necklace, NEVER output a ring, bracelet, earring, pendant, or anklet as the product.
+- If the target gemstone is opal, NEVER substitute coral, ruby, emerald, sapphire, or another gemstone.
+- Preserve the target product type and primary gemstone in the optimized title and description.
+- Preserve only objective facts that are supported by the current listing.
 
 GOAL:
 Create a significantly better, buyer-focused Etsy title and 13 tags based on
@@ -1776,22 +1921,29 @@ Return ONLY valid JSON:
 """
 
     last_error = None
-    for attempt in range(2):
+    last_identity_errors = []
+    for attempt in range(3):
         try:
             response = client.responses.create(
                 model="gpt-5.6-luna",
                 input=prompt,
             )
             text = getattr(response, "output_text", "") or ""
-            return parse_listing_json(text)
+            result = parse_listing_json(text)
+            identity_errors = validate_product_identity(result, identity)
+            if not identity_errors:
+                result["product_identity_lock"] = identity
+                return result
+
+            last_identity_errors = identity_errors
+            prompt = prompt + "\n\nIDENTITY VALIDATION FAILED. You must regenerate the entire JSON. Fix these exact errors:\n- " + "\n- ".join(identity_errors) + "\nDo not change the target product, gemstone, or supported facts. Return ONLY valid JSON."
         except Exception as exc:
             last_error = exc
-            if attempt == 0:
-                # A compact retry avoids failures caused by an overly long or
-                # partially malformed model response while keeping the same rules.
-                prompt = prompt + "\n\nFINAL REMINDER: Return ONLY one compact JSON object. No markdown, no commentary, no code fences. Ensure all JSON strings escape newlines and quotes correctly."
+            prompt = prompt + "\n\nFINAL REMINDER: Return ONLY one compact JSON object. No markdown, no commentary, no code fences. Ensure all JSON strings escape newlines and quotes correctly."
 
-    raise RuntimeError(f"Optimizer AI response failed after 2 attempts: {type(last_error).__name__}: {last_error}")
+    if last_identity_errors:
+        raise RuntimeError("Optimizer AI produced a product-mismatched result after 3 attempts: " + " | ".join(last_identity_errors))
+    raise RuntimeError(f"Optimizer AI response failed after 3 attempts: {type(last_error).__name__}: {last_error}")
 
 
 @app.get("/optimizer", response_class=HTMLResponse)
@@ -1988,7 +2140,7 @@ function render(data) {
   renderPills('primaryKeywords',ki.primary_keywords); renderPills('secondaryKeywords',ki.secondary_keywords); renderPills('longTailKeywords',ki.long_tail_keywords); renderPills('buyerIntentKeywords',ki.buyer_intent_keywords); renderPills('avoidKeywords',ki.avoid_keywords);
   $('result').classList.remove('hidden');
 }
-$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();fd.append('listing_url',$('listing_url').value.trim());if($('listing_id_hint').value)fd.append('listing_id',$('listing_id_hint').value);const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
+$('form').addEventListener('submit',async e=>{e.preventDefault();$('run').disabled=true;$('status').className='status';$('status').textContent='Analyzing Etsy listing and marketplace keyword signals…';$('result').classList.add('hidden');try{const fd=new FormData();const enteredUrl=$('listing_url').value.trim();fd.append('listing_url',enteredUrl);if(!enteredUrl && $('listing_id_hint').value)fd.append('listing_id',$('listing_id_hint').value);const r=await fetch('/analyze-existing-listing',{method:'POST',body:fd});const raw=await r.text();let data;try{data=raw?JSON.parse(raw):{};}catch(parseErr){throw new Error(`Server returned invalid JSON (${r.status}): ${raw.slice(0,300)}`);}if(!r.ok)throw new Error(data.detail||`Analysis failed (HTTP ${r.status})`);if(data.validation_errors?.length){$('status').className='status warn';$('status').textContent='Analysis completed, but the generated result needs validation review.';}else{$('status').className='status success';$('status').textContent='Analysis complete — nothing was changed on Etsy.';}render(data);}catch(err){$('status').className='status error';$('status').textContent=err.message||'Something went wrong.';}finally{$('run').disabled=false;}});
 document.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{const key=btn.dataset.copy;const value=key==='tags'?latest.tags.join(', '):latest[key];try{await navigator.clipboard.writeText(value||'');const old=btn.textContent;btn.textContent='Copied ✓';setTimeout(()=>btn.textContent=old,1200);}catch(_){btn.textContent='Copy failed';}}));
 $('copyAll').addEventListener('click',async()=>{const text=`TITLE\n${latest.title}\n\n13 TAGS\n${latest.tags.map((x,i)=>`${i+1}. ${x}`).join('\n')}\n\nDESCRIPTION\n${latest.description}`;try{await navigator.clipboard.writeText(text);const b=$('copyAll');b.textContent='Copied ✓';setTimeout(()=>b.textContent='📋 Copy All SEO Content',1400);}catch(_){$('copyAll').textContent='Copy failed';}});
 </script>
@@ -2006,7 +2158,16 @@ async def analyze_existing_listing(
     This endpoint only reads/analyzes the listing. It does NOT edit, create,
     activate, or publish anything on Etsy.
     """
-    resolved_id = extract_listing_id(listing_id) or extract_listing_id(listing_url)
+    url_id = extract_listing_id(listing_url)
+    id_id = extract_listing_id(listing_id)
+
+    # The explicit Etsy URL is authoritative. This prevents a stale hidden
+    # listing_id query parameter from causing the optimizer to analyze a
+    # completely different listing.
+    if url_id and id_id and url_id != id_id:
+        resolved_id = url_id
+    else:
+        resolved_id = url_id or id_id
 
     if not resolved_id:
         raise HTTPException(
