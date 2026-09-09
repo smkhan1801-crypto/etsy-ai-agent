@@ -1508,21 +1508,56 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
     ))
 
     def _tag_is_supported(tag):
+        tag = normalize_text(tag)
+        if not tag:
+            return False
+        # Exact/subphrase evidence from the source listing is strongest.
         if any(term and (tag in term or term in tag) for term in source_terms_for_tags):
             return True
         if tag in signal_phrases_for_tags:
             return True
+
         tag_words = set(re.findall(r"[a-z0-9]+", tag))
-        if not (tag_words & identity_words_for_tags):
+        if not tag_words:
             return False
+
+        # A tag is also supported when every meaningful word is evidenced by the
+        # source listing (title, description, existing tags, materials/style),
+        # and at least one word is a product/gemstone/material identity word.
+        source_word_pool = set()
+        for source_value in [
+            current_listing.get("title", ""),
+            current_listing.get("description", ""),
+            *(current_listing.get("tags", []) or []),
+            *(current_listing.get("materials", []) or []),
+            *(current_listing.get("style", []) or []),
+        ]:
+            source_word_pool.update(re.findall(r"[a-z0-9]+", normalize_text(str(source_value))))
+        generic_words = {
+            "natural", "genuine", "handmade", "jewelry", "jewellery", "gift",
+            "for", "her", "women", "woman", "men", "mens", "dangle",
+            "dangles", "drop", "earrings", "earring", "chain", "gold",
+        }
+        meaningful = {w for w in tag_words if w not in generic_words and len(w) > 2}
+        if meaningful and meaningful.issubset(source_word_pool) and (tag_words & identity_words_for_tags):
+            return True
+
+        # Finally, accept a marketplace phrase only when it shares identity
+        # language with this listing. This keeps marketplace evidence directional
+        # without allowing unrelated competitor products into the tag set.
         return any(
             sig and len(tag_words & set(re.findall(r"[a-z0-9]+", sig))) >= 1
+            and (tag_words & identity_words_for_tags)
             for sig in signal_phrases_for_tags
         )
 
-    relevant = sum(1 for t in tag_norm if _tag_is_supported(t))
+    supported_flags = {t: _tag_is_supported(t) for t in tag_norm}
+    relevant = sum(1 for ok in supported_flags.values() if ok)
     if tags:
         gp += round(4 * relevant / len(tags))
+    unsupported_tags = [t for t, ok in supported_flags.items() if not ok]
+    if unsupported_tags:
+        gr.append("Replace unsupported/weak tags: " + ", ".join(unsupported_tags[:5]) + ".")
     if tags and relevant < max(7, round(len(tags) * 0.55)):
         gr.append("More tags should be directly supported by source facts or marketplace signals.")
 
@@ -2435,6 +2470,110 @@ def validate_product_identity(optimized, identity):
     return list(dict.fromkeys(errors))
 
 
+def repair_optimized_tags(optimized, listing, market_signals, identity):
+    """Deterministically repair only unsupported/duplicate tags.
+
+    AI remains responsible for the SEO strategy. This safety pass only replaces
+    tags that cannot be grounded in the source listing or marketplace evidence,
+    so the final 13-tag set does not lose a point merely because a single vague
+    phrase slipped through generation.
+    """
+    raw_tags = [str(x).strip() for x in (optimized.get("recommended_tags", []) or []) if str(x).strip()]
+    raw_tags = raw_tags[:13]
+    source_texts = [
+        listing.get("title", ""), listing.get("description", ""),
+        *(listing.get("tags", []) or []), *(listing.get("materials", []) or []),
+        *(listing.get("style", []) or []),
+    ]
+    source_pool = []
+    seen_pool = set()
+    for value in source_texts:
+        txt = normalize_text(str(value))
+        # Existing tags are excellent truthful fallbacks; title-derived phrases
+        # provide additional specific choices when needed.
+        if isinstance(value, str) and len(txt) <= 20 and len(txt.split()) >= 1:
+            if txt not in seen_pool:
+                source_pool.append(txt)
+                seen_pool.add(txt)
+        ws = words(str(value))
+        for n in (2, 3):
+            for i in range(max(0, len(ws) - n + 1)):
+                phrase = " ".join(ws[i:i+n]).strip()
+                if len(phrase) <= 20 and phrase not in seen_pool:
+                    source_pool.append(phrase)
+                    seen_pool.add(phrase)
+
+    # Marketplace tag/phrase signals are secondary fallback candidates.
+    market_pool = []
+    for row in (market_signals.get("high_signal_tags", []) or []) + (market_signals.get("high_signal_phrases", []) or []):
+        value = row.get("keyword", "") if isinstance(row, dict) else str(row)
+        value = normalize_text(value)
+        if value and len(value) <= 20 and value not in market_pool:
+            market_pool.append(value)
+
+    def source_supported(tag):
+        t = normalize_text(tag)
+        if not t or len(t) > 20:
+            return False
+        if any(t in normalize_text(str(v)) or normalize_text(str(v)) in t for v in source_texts if str(v).strip()):
+            return True
+        tw = set(re.findall(r"[a-z0-9]+", t))
+        sw = set(re.findall(r"[a-z0-9]+", normalize_text(" ".join(map(str, source_texts)))))
+        identity_words = set(re.findall(r"[a-z0-9]+", normalize_text(" ".join([identity.get("product_type", "")] + (identity.get("gemstones", []) or [])))))
+        return bool(tw and tw.issubset(sw) and (tw & identity_words))
+
+    def market_supported(tag):
+        t = normalize_text(tag)
+        if t in {normalize_text(str(x)) for x in market_pool}:
+            tw = set(re.findall(r"[a-z0-9]+", t))
+            iw = set(re.findall(r"[a-z0-9]+", normalize_text(" ".join([identity.get("product_type", "")] + (identity.get("gemstones", []) or [])))))
+            return bool(tw & iw)
+        return False
+
+    final = []
+    used = set()
+    for tag in raw_tags:
+        n = normalize_text(tag)
+        if n and n not in used and len(n) <= 20 and (source_supported(n) or market_supported(n)):
+            final.append(tag)
+            used.add(n)
+
+    candidates = []
+    for tag in source_pool + market_pool:
+        n = normalize_text(tag)
+        if not n or n in used or len(n) > 20:
+            continue
+        if source_supported(n) or market_supported(n):
+            candidates.append(tag)
+
+    # Prefer specific multi-word fallbacks and preserve the seller's original
+    # tags when they are already factual and unique.
+    candidates = list(dict.fromkeys(candidates))
+    candidates.sort(key=lambda x: (len(x.split()) == 2, len(x.split()) == 3, len(x)), reverse=True)
+    for tag in candidates:
+        if len(final) >= 13:
+            break
+        n = normalize_text(tag)
+        if n not in used:
+            final.append(tag)
+            used.add(n)
+
+    # If the AI returned 13 valid unique tags, never truncate the result here.
+    # Only fall back to the original tags when a replacement was necessary.
+    if len(final) < 13:
+        for tag in (listing.get("tags", []) or []):
+            n = normalize_text(str(tag))
+            if n and n not in used and len(n) <= 20:
+                final.append(str(tag).strip())
+                used.add(n)
+            if len(final) >= 13:
+                break
+
+    if len(final) == 13:
+        optimized["recommended_tags"] = final
+    return optimized
+
+
 def optimize_existing_listing(listing, market_signals):
     identity = extract_product_identity(listing)
     current = {
@@ -2620,6 +2759,11 @@ MARKETPLACE SIGNALS:
 Fix the listed gaps without inventing facts.
 
 You must optimize toward every applicable deterministic check.
+For every reported "13 tags" gap, inspect the exact weak/unsupported tag names
+listed in the score report. Replace each weak tag with a different, evidence-backed
+phrase from the source listing or relevant marketplace signals. Do not simply keep
+the same weak tag. The replacement must accurately describe this exact product, be
+20 characters or fewer, and remain unique across all 13 tags.
 For every reported "keyword coverage" gap, inspect the exact supported keyword
 phrase named in the score report. If it is supported by the source listing or
 marketplace evidence, incorporate it naturally into the title, one tag, or the
@@ -2753,7 +2897,7 @@ def optimizer_page(listing_id: str = Query("")):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer — V11</title>
+<title>Etsy AI SEO Optimizer — V17</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -3070,6 +3214,7 @@ async def analyze_existing_listing(
 
     optimized = optimize_existing_listing(listing, market_signals)
     identity = extract_product_identity(listing)
+    optimized = repair_optimized_tags(optimized, listing, market_signals, identity)
 
     # Up to 5 targeted deterministic validation/improvement rounds. Gemini suggests edits;
     # the score is always calculated by the rules above.
@@ -3123,6 +3268,7 @@ async def analyze_existing_listing(
         optimized = improve_existing_listing_for_score(
             listing, optimized, score, identity, market_signals
         )
+        optimized = repair_optimized_tags(optimized, listing, market_signals, identity)
 
         # Extract exact supported phrases from the deterministic report and
         # pass them directly into the next improvement prompt.
