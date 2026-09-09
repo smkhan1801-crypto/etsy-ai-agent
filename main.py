@@ -34,12 +34,20 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# Built-in fallback pool is intentionally broader than the Render env defaults.
+# This prevents a temporary 503/high-demand event on one Flash model from taking
+# the whole optimizer down. These are current stable Gemini 3 Flash models.
+_BUILTIN_GEMINI_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+]
 GEMINI_FALLBACK_MODELS = [
-    m.strip() for m in os.getenv(
-        "GEMINI_FALLBACK_MODELS",
-        "gemini-3.5-flash,gemini-3.1-flash-lite"
-    ).split(",") if m.strip()
+    m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()
 ]
 
 _gemini_client = None
@@ -60,10 +68,12 @@ class GeminiTextResponse:
         self.output_text = text or ""
 
 def _gemini_models_to_try():
-    # Try the configured model first, then free-tier Flash fallbacks.
+    # Try the Render-configured model first, then user-configured fallbacks,
+    # then a built-in pool of current stable/free-tier Flash models. This means
+    # an old GEMINI_MODEL env var cannot lock the app to one overloaded model.
     seen = set()
     models = []
-    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS, *_BUILTIN_GEMINI_FALLBACK_MODELS]:
         if model and model not in seen:
             seen.add(model)
             models.append(model)
@@ -79,8 +89,9 @@ def _is_gemini_transient_error(exc):
 def _gemini_generate_with_fallback(contents, config, purpose="text"):
     last_exc = None
     models = _gemini_models_to_try()
-    for model_index, model in enumerate(models):
-        # One short retry for a transient failure, then move to the next model.
+    transient_errors = []
+    for model in models:
+        # Give each model two chances, with exponential backoff, then move on.
         for attempt in range(2):
             try:
                 response = get_gemini_client().models.generate_content(
@@ -96,14 +107,16 @@ def _gemini_generate_with_fallback(contents, config, purpose="text"):
                 last_exc = exc
                 if not _is_gemini_transient_error(exc):
                     raise
-                # Small exponential backoff for 503/429/5xx.
+                transient_errors.append(f"{model}: {type(exc).__name__}: {exc}")
+                # Google recommends exponential backoff for transient 429/5xx.
                 if attempt == 0:
                     time.sleep(1.5)
-        # If the configured model is busy, continue to the next free-tier model.
+        # Model is temporarily busy/unavailable; immediately fail over.
 
     raise RuntimeError(
-        "Gemini is temporarily unavailable on all configured models. "
-        f"Tried: {', '.join(models)}. Last error: {type(last_exc).__name__}: {last_exc}"
+        "Gemini is temporarily unavailable across the fallback pool. "
+        f"Tried: {', '.join(models)}. Last error: {type(last_exc).__name__}: {last_exc}. "
+        "The optimizer did not change Etsy."
     )
 
 def gemini_generate_text(prompt, max_output_tokens=3000, json_mode=False):
