@@ -1250,7 +1250,14 @@ def validate_listing(candidate):
 
 
 def seo_score_report(current_listing, optimized_result, market_signals, validation_errors=None, identity=None):
-    """Deterministic 100-point SEO quality score; NOT Etsy's ranking score."""
+    """Evidence-aware deterministic SEO quality score; NOT Etsy's ranking score.
+
+    v2 scores only checks that can actually be evaluated from the source listing
+    and Etsy API response. If Etsy does not expose a particular attribute field,
+    that criterion is excluded from the denominator instead of being treated as
+    a failure. A genuine 100/100 therefore means every applicable measurable
+    check passed.
+    """
     validation_errors = validation_errors or []
     identity = identity or extract_product_identity(current_listing)
 
@@ -1271,49 +1278,79 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
 
     # 1. Product identity = 15
     ip, ir = 0, []
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn): ip += 5
-    else: ir.append("Target product type is missing from the optimized title.")
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", dn): ip += 3
-    else: ir.append("Target product type is missing from the description.")
-    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", tn): ip += 4
-    else: ir.append("Primary gemstone is missing from the title.")
-    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", dn): ip += 3
-    else: ir.append("Primary gemstone is missing from the description.")
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn):
+        ip += 5
+    else:
+        ir.append("Target product type is missing from the optimized title.")
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", dn):
+        ip += 3
+    else:
+        ir.append("Target product type is missing from the description.")
+    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", tn):
+        ip += 4
+    else:
+        ir.append("Primary gemstone is missing from the title.")
+    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", dn):
+        ip += 3
+    else:
+        ir.append("Primary gemstone is missing from the description.")
 
     # 2. Title = 15
     tp, tr = 0, []
-    if title: tp += 3
-    if 8 <= len(tw) <= 15: tp += 3
-    elif 5 <= len(tw) <= 17: tp += 1
-    else: tr.append("Aim for roughly 8–15 readable words.")
-    if len(title) <= 140: tp += 2
-    else: tr.append("Title exceeds 140 characters.")
-    if tw and len(tw) == len(set(tw)): tp += 3
-    else: tr.append("Title repeats words.")
+    if title:
+        tp += 3
+    else:
+        tr.append("Title is empty.")
+    if 8 <= len(tw) <= 15:
+        tp += 3
+    elif 5 <= len(tw) <= 17:
+        tp += 1
+        tr.append("Aim for roughly 8–15 readable words.")
+    else:
+        tr.append("Aim for roughly 8–15 readable words.")
+    if len(title) <= 140:
+        tp += 2
+    else:
+        tr.append("Title exceeds 140 characters.")
+    if tw and len(tw) == len(set(tw)):
+        tp += 3
+    else:
+        tr.append("Title repeats words.")
     subjective = {"best","perfect","beautiful","unique","amazing","stunning","gorgeous","must","premium","luxury"}
-    if not subjective.intersection(tw): tp += 2
-    else: tr.append("Remove subjective sales language from the title.")
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn[:max(1, min(len(tn), 80))]): tp += 2
-    else: tr.append("Put the actual product type near the beginning.")
+    if not subjective.intersection(tw):
+        tp += 2
+    else:
+        tr.append("Remove subjective sales language from the title.")
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn[:max(1, min(len(tn), 80))]):
+        tp += 2
+    else:
+        tr.append("Put the actual product type near the beginning.")
 
     # 3. Tags = 20
     gp, gr = 0, []
-    if len(tags) == 13: gp += 4
-    else: gr.append("Exactly 13 tags are required.")
+    if len(tags) == 13:
+        gp += 4
+    else:
+        gr.append("Exactly 13 tags are required.")
     if tags:
-        gp += round(4 * sum(len(t) <= 20 for t in tags) / len(tags))
-        if any(len(t) > 20 for t in tags): gr.append("Every tag must be 20 characters or fewer.")
+        valid_len = sum(len(t) <= 20 for t in tags)
+        gp += round(4 * valid_len / len(tags))
+        if valid_len < len(tags):
+            gr.append("Every tag must be 20 characters or fewer.")
     unique_ratio = len(set(tag_norm)) / max(1, len(tag_norm))
     gp += round(4 * unique_ratio)
-    if unique_ratio < 1: gr.append("Remove duplicate tags.")
+    if unique_ratio < 1:
+        gr.append("Remove duplicate tags.")
     protected = [normalize_text(x) for x in identity.get("protected_terms", []) if x]
     relevant = sum(1 for t in tag_norm if any(p and (p in t or t in p) for p in protected))
     gp += round(4 * relevant / max(1, len(tags)))
-    if tags and relevant / len(tags) < 0.5: gr.append("More tags should directly reinforce the actual product.")
+    if tags and relevant / len(tags) < 0.5:
+        gr.append("More tags should directly reinforce the actual product.")
     first_words = [t.split()[0] for t in tag_norm if t.split()]
     diversity = len(set(first_words)) / max(1, len(first_words))
     gp += round(4 * min(1, diversity))
-    if diversity < 0.5: gr.append("Tag structures are too repetitive.")
+    if diversity < 0.5:
+        gr.append("Tag structures are too repetitive.")
     gp = min(20, gp)
 
     # 4. Keyword coverage = 15
@@ -1329,88 +1366,184 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         if vals:
             covered = sum(1 for k in vals[:take] if k and k in alln)
             kp += round(pts * covered / min(take, len(vals)))
+            if covered < min(take, len(vals)):
+                kr.append(f"Some {key.replace('_',' ')} are not covered by the listing copy.")
         else:
             kr.append(f"No {key.replace('_',' ')} were returned.")
-            kp += 1 if pts <= 3 else 0
     kp = min(15, kp)
-    if kp < 12: kr.append("Important keyword groups are not sufficiently covered by the listing copy.")
+    if kp < 12:
+        kr.append("Important keyword groups are not sufficiently covered by the listing copy.")
 
     # 5. Description = 15
     dp, dr = 0, []
-    if description: dp += 3
+    if description:
+        dp += 3
+    else:
+        dr.append("Description is empty.")
     first = re.split(r"(?<=[.!?])\s+", description, maxsplit=1)[0] if description else ""
     fn = normalize_text(first)
-    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", fn): dp += 3
-    else: dr.append("First sentence should clearly identify the product.")
-    if not primary_gem or primary_gem in fn: dp += 3
-    else: dr.append("First sentence should include the primary gemstone.")
-    if len(description) >= 250: dp += 2
-    elif len(description) >= 120: dp += 1
-    else: dr.append("Description is too short.")
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", fn):
+        dp += 3
+    else:
+        dr.append("First sentence should clearly identify the product.")
+    if not primary_gem or primary_gem in fn:
+        dp += 3
+    else:
+        dr.append("First sentence should include the primary gemstone.")
+    if len(description) >= 250:
+        dp += 2
+    elif len(description) >= 120:
+        dp += 1
+        dr.append("Description can be expanded with supported buyer information.")
+    else:
+        dr.append("Description is too short.")
     detail_terms = ["material","size","stone","gemstone","design","wear","care","shipping","gift"]
     dp += min(2, sum(1 for x in detail_terms if re.search(r"\b"+x+r"\b", dn)) // 2)
-    if not subjective.intersection(words(description)): dp += 1
-    else: dr.append("Avoid excessive subjective sales language.")
-    if len(description.split()) >= 80: dp += 3
-    else: dr.append("Add useful buyer information where the source listing supports it.")
+    if not subjective.intersection(words(description)):
+        dp += 1
+    else:
+        dr.append("Avoid excessive subjective sales language.")
+    if len(description.split()) >= 80:
+        dp += 3
+    else:
+        dr.append("Add useful buyer information where the source listing supports it.")
     dp = min(15, dp)
 
-    # 6. Category/attributes = 10
+    # 6. Category & attributes = 10, evidence-aware.
     attrs = current_listing.get("attributes", []) or []
-    ar = optimized_result.get("attribute_recommendations", []) or []
-    ap, apr = 0, []
-    if current_listing.get("taxonomy_id"): ap += 4
-    else: apr.append("Category/taxonomy is not confirmed.")
-    if isinstance(attrs, list) and len(attrs) >= 4: ap += 4
-    elif isinstance(attrs, list) and len(attrs) >= 2: ap += 2; apr.append("Review additional relevant Etsy attributes.")
-    else: apr.append("Few/no source attributes are available.")
-    ap += 2 if ar else 1
-    ap = min(10, ap)
+    taxonomy_id = current_listing.get("taxonomy_id")
+    taxonomy_properties = current_listing.get("taxonomy_properties", []) or []
+
+    ap_earned = 0
+    excluded_attribute_points = 0
+    apr = []
+
+    if taxonomy_id:
+        ap_earned += 4
+    else:
+        apr.append("Category/taxonomy is not confirmed.")
+
+    if isinstance(attrs, list) and len(attrs) > 0:
+        if len(attrs) >= 4:
+            ap_earned += 4
+        elif len(attrs) >= 2:
+            ap_earned += 2
+            apr.append("Review additional relevant Etsy attributes.")
+        else:
+            apr.append("Only limited source attributes are available.")
+    else:
+        # Generic selected attributes are not exposed in this listing payload.
+        # Do not pretend this means the listing is bad.
+        excluded_attribute_points += 4
+        apr.append("Selected Etsy attribute values were not exposed in the listing payload; not scored as a failure.")
+
+    if taxonomy_properties:
+        supports_attrs = sum(
+            1 for p in taxonomy_properties
+            if isinstance(p, dict) and p.get("supports_attributes")
+        )
+        if supports_attrs:
+            ap_earned += 2
+        else:
+            excluded_attribute_points += 2
+            apr.append("Taxonomy schema exposes no attribute-capable properties for this category.")
+    else:
+        excluded_attribute_points += 2
+        apr.append("Taxonomy property schema could not be read; not scored as a failure.")
+
+    ap_max_applicable = max(1, 10 - excluded_attribute_points)
+    ap = min(ap_max_applicable, ap_earned)
 
     # 7. Buyer/conversion quality = 10
     bp, br = 0, []
-    if len(description) >= 250: bp += 3
-    elif len(description) >= 120: bp += 2
-    if re.search(r"\b(size|dimension|length|mm|inch|inches)\b", dn): bp += 2
-    else: br.append("Add known size/dimensions if the source listing provides them.")
-    if re.search(r"\b(material|sterling|gold|silver|vermeil|gemstone|opal|spinel)\b", dn): bp += 2
-    else: br.append("Make supported material/gemstone information easy to find.")
-    if re.search(r"\b(gift|birthday|anniversary|wedding|holiday|present)\b", dn): bp += 1
-    else: br.append("Add a truthful gifting/use context when relevant.")
-    if not re.search(r"\b(heal|healing|cure|treat|medical)\b", alln): bp += 1
-    else: br.append("Remove medical/healing claims.")
-    if not validation_errors: bp += 1
-    else: br.append("Resolve hard validation errors.")
+    if len(description) >= 250:
+        bp += 3
+    elif len(description) >= 120:
+        bp += 2
+    if re.search(r"\b(size|dimension|length|mm|inch|inches)\b", dn):
+        bp += 2
+    else:
+        br.append("Add known size/dimensions if the source listing provides them.")
+    if re.search(r"\b(material|sterling|gold|silver|vermeil|gemstone|opal|spinel)\b", dn):
+        bp += 2
+    else:
+        br.append("Make supported material/gemstone information easy to find.")
+    if re.search(r"\b(gift|birthday|anniversary|wedding|holiday|present)\b", dn):
+        bp += 1
+    else:
+        br.append("Add a truthful gifting/use context when relevant.")
+    if not re.search(r"\b(heal|healing|cure|treat|medical)\b", alln):
+        bp += 1
+    else:
+        br.append("Remove medical/healing claims.")
+    if not validation_errors:
+        bp += 1
+    else:
+        br.append("Resolve hard validation errors.")
     bp = min(10, bp)
 
-    total = min(100, ip + tp + gp + kp + dp + ap + bp)
-    sections = [
+    fixed_sections = [
         ("Product identity", ip, 15, ir),
         ("Title", tp, 15, tr),
         ("13 tags", gp, 20, gr),
         ("Keyword coverage", kp, 15, kr),
         ("Description", dp, 15, dr),
-        ("Category & attributes", ap, 10, apr),
         ("Buyer/conversion quality", bp, 10, br),
     ]
-    gaps = [{"section": n, "score": s, "max": m, "points_lost": m-s, "reasons": rs[:5]} for n,s,m,rs in sections if s < m]
+    raw_earned = sum(s for _, s, _, _ in fixed_sections) + ap
+    raw_max = sum(m for _, _, m, _ in fixed_sections) + ap_max_applicable
+    normalized_total = round((raw_earned / raw_max) * 100) if raw_max else 0
+    normalized_total = max(0, min(100, normalized_total))
+
+    sections = fixed_sections + [("Category & attributes", ap, ap_max_applicable, apr)]
+    gaps = [
+        {
+            "section": n,
+            "score": s,
+            "max": m,
+            "points_lost": m - s,
+            "reasons": rs[:5],
+        }
+        for n, s, m, rs in sections
+        if s < m
+    ]
+
     return {
         "current_score": None,
-        "optimized_score": total,
-        "improvement": None,
-        "grade": "A+" if total == 100 else "A" if total >= 90 else "B" if total >= 80 else "C" if total >= 70 else "D" if total >= 60 else "E",
-        "is_genuine_100": total == 100,
+        "optimized_score": normalized_total,
+        "raw_points": raw_earned,
+        "raw_max": raw_max,
+        "applicable_points": raw_max,
+        "excluded_points": 10 - ap_max_applicable,
+        "grade": (
+            "A+" if normalized_total == 100
+            else "A" if normalized_total >= 90
+            else "B" if normalized_total >= 80
+            else "C" if normalized_total >= 70
+            else "D" if normalized_total >= 60
+            else "E"
+        ),
+        "is_genuine_100": normalized_total == 100,
         "breakdown": {
             "product_identity": {"optimized": ip, "max": 15},
             "title": {"optimized": tp, "max": 15},
             "tags": {"optimized": gp, "max": 20},
             "keyword_coverage": {"optimized": kp, "max": 15},
             "description": {"optimized": dp, "max": 15},
-            "attributes": {"optimized": ap, "max": 10},
+            "attributes": {
+                "optimized": ap,
+                "max": ap_max_applicable,
+                "original_max": 10,
+                "excluded": 10 - ap_max_applicable,
+            },
             "buyer_quality": {"optimized": bp, "max": 10},
         },
         "gaps": gaps,
-        "note": "Genuine internal SEO-quality score based on deterministic checks. It is not Etsy's ranking score.",
+        "note": (
+            "Genuine internal SEO-quality score based on deterministic checks. "
+            "It is not Etsy's ranking score. v2 excludes unavailable Etsy attribute "
+            "fields from the denominator instead of treating unavailable data as a failure."
+        ),
     }
 
 def rewrite_listing(candidate, similarity_matches, claim_problems):
@@ -2123,6 +2256,7 @@ Return ONLY valid JSON:
     "buyer_intent_keywords": ["..."],
     "avoid_keywords": ["..."]
   }},
+  "attribute_recommendations": ["Only recommend attributes that can be verified from the source listing or Etsy taxonomy schema."],
   "changes_summary": ["..."],
   "search_volume_note": "Exact Etsy search volume is not available through the API; these are marketplace ranking/frequency signals."
 }}
@@ -2191,6 +2325,12 @@ MARKETPLACE SIGNALS:
 "high_signal_tags": (market_signals.get("high_signal_tags", []) or [])[:10]}, ensure_ascii=False)}
 
 Fix the listed gaps without inventing facts.
+
+Optimization priority:
+1. Fix tag quality and relevance gaps first.
+2. Fix keyword coverage gaps with truthful phrases supported by the source.
+3. Improve buyer information only where the source listing provides the fact.
+4. Never game the score by inventing attributes or unsupported product details.
 
 Rules:
 - Preserve exact product type and gemstones from the source.
@@ -2356,14 +2496,14 @@ def optimizer_page(listing_id: str = Query("")):
       <div class="card full">
         <div class="section-title"><h2>🧠 SEO Intelligence Breakdown</h2></div>
         <div class="breakdown">
-          <div class="break-row"><span>Title</span><b id="titleBreak">—</b><small>/ 70</small></div>
+          <div class="break-row"><span>Title</span><b id="titleBreak">—</b><small>/ 15</small></div>
           <div class="bar"><i id="titleBar"></i></div>
           <div class="break-row"><span>13 Tags</span><b id="tagsBreak">—</b><small>/ 20</small></div>
           <div class="bar"><i id="tagsBar"></i></div>
           <div class="break-row"><span>Description</span><b id="descBreak">—</b><small>/ 10</small></div>
           <div class="bar"><i id="descBar"></i></div>
         </div>
-        <p class="muted">The breakdown shows how the optimizer scores listing structure. It is not Etsy's internal ranking formula.</p>
+        <p id="scoreBasis" class="muted">The breakdown shows how the optimizer scores measurable listing structure. It is not Etsy's internal ranking formula.</p>
       </div>
       <div class="card full">
         <div class="section-title"><h2>🔄 Current vs Optimized</h2></div>
@@ -2412,7 +2552,9 @@ function render(data) {
   const curTags=data.current_listing?.tags||[]; $('compareCurrentTags').innerHTML=''; curTags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareCurrentTags').appendChild(s);});
   $('compareOptimizedTags').innerHTML=''; latest.tags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareOptimizedTags').appendChild(s);});
   const sc=data.seo_score||{}; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('scoreStatus').textContent=sc.is_genuine_100?'100/100 ✓':'Needs improvement'; $('improvementRounds').textContent=sc.improvement_rounds ?? '—'; $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
-  const gaps=sc.gaps||[]; $('scoreGaps').innerHTML=gaps.length ? '<b>Points still missing:</b> '+gaps.map(g=>`${g.section}: ${g.points_lost} — ${(g.reasons||[]).join('; ')}`).join(' | ') : '<span class="success"><b>100/100 — all measurable checks passed.</b></span>';
+  const excluded=sc.excluded_points||0; const rawMax=sc.raw_max||sc.applicable_points||100; const rawPts=sc.raw_points;
+  $('scoreBasis').textContent=excluded ? `Evidence-aware score: ${rawPts ?? '—'}/${rawMax} applicable points. ${excluded} point(s) excluded because Etsy did not expose those fields in this listing payload.` : `Evidence-aware score: ${rawPts ?? '—'}/${rawMax} measurable points.`;
+  const gaps=sc.gaps||[]; $('scoreGaps').innerHTML=gaps.length ? '<b>Points still missing:</b> '+gaps.map(g=>`${g.section}: ${g.points_lost} — ${(g.reasons||[]).join('; ')}`).join(' | ') : '<span class="success"><b>100/100 — all applicable measurable checks passed.</b></span>';
   const bd=sc.breakdown||{};
   const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; if($(el)) $(el).textContent=(val ?? '—'); if($(bar)) $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
   setBreak('title','titleBreak','titleBar'); setBreak('tags','tagsBreak','tagsBar'); setBreak('description','descBreak','descBar');
@@ -2480,6 +2622,20 @@ async def analyze_existing_listing(
 
     listing = response.json()
 
+    # Read-only Etsy taxonomy schema lookup. This gives the optimizer the current
+    # category's supported property framework without writing anything to Etsy.
+    taxonomy_id_for_lookup = listing.get("taxonomy_id")
+    listing["taxonomy_properties"] = []
+    if taxonomy_id_for_lookup:
+        try:
+            prop_url = f"https://api.etsy.com/v3/application/seller-taxonomy/nodes/{taxonomy_id_for_lookup}/properties"
+            prop_response = etsy_get(prop_url, access_token)
+            if prop_response.ok:
+                prop_payload = prop_response.json() or {}
+                listing["taxonomy_properties"] = prop_payload.get("results", []) or []
+        except Exception:
+            listing["taxonomy_properties"] = []
+
     # Safety check: only analyze the listing; do not allow an arbitrary public
     # listing to become a write target later in this endpoint.
     if str(listing.get("shop_id")) != str(context["shop_id"]):
@@ -2528,6 +2684,13 @@ async def analyze_existing_listing(
                 "description": listing.get("description", ""),
                 "attributes": listing.get("attributes", []) or [],
                 "taxonomy_id": listing.get("taxonomy_id"),
+                "taxonomy_properties": listing.get("taxonomy_properties", []) or [],
+                "materials": listing.get("materials", []) or [],
+                "style": listing.get("style", []) or [],
+                "item_length": listing.get("item_length"),
+                "item_width": listing.get("item_width"),
+                "item_height": listing.get("item_height"),
+                "item_dimensions_unit": listing.get("item_dimensions_unit"),
             },
             optimized,
             market_signals,
@@ -2580,6 +2743,7 @@ async def analyze_existing_listing(
             "description": listing.get("description", ""),
             "materials": listing.get("materials", []) or [],
             "taxonomy_id": listing.get("taxonomy_id"),
+            "taxonomy_properties_checked": len(listing.get("taxonomy_properties", []) or []),
             "num_favorers": listing.get("num_favorers"),
             "url": listing.get("url", ""),
             "etsy_suggested_title": listing.get("suggested_title"),
