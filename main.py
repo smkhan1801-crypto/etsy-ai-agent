@@ -1204,72 +1204,168 @@ def validate_listing(candidate):
 
 
 
-def seo_score_report(current_listing, optimized_result, market_signals, validation_errors):
-    """Directional SEO/readability score; not an Etsy ranking score."""
-    def score_title(title):
-        title = str(title or '').strip()
-        ws = words(title)
-        score = 0
-        if title: score += 20
-        if 8 <= len(ws) <= 15: score += 15
-        elif 5 <= len(ws) <= 18: score += 8
-        if len(title) <= 140: score += 15
-        if len(ws) == len(set(ws)): score += 10
-        if title and ws: score += 10
-        return min(score, 70)
+def seo_score_report(current_listing, optimized_result, market_signals, validation_errors=None, identity=None):
+    """Deterministic 100-point SEO quality score; NOT Etsy's ranking score."""
+    validation_errors = validation_errors or []
+    identity = identity or extract_product_identity(current_listing)
 
-    def score_tags(tags):
-        tags = tags if isinstance(tags, list) else []
-        if not tags: return 0
-        valid = [str(t).strip() for t in tags if str(t).strip()]
-        length_ok = sum(len(t) <= 20 for t in valid)
-        unique = len({t.lower() for t in valid})
-        return min(20, round((length_ok / 13) * 12) + (4 if len(valid) == 13 else 0) + (4 if unique == len(valid) else 0))
+    title = str(optimized_result.get("recommended_title", "") or "").strip()
+    tags = [str(t).strip() for t in (optimized_result.get("recommended_tags", []) or []) if str(t).strip()]
+    description = str(optimized_result.get("recommended_description", "") or "").strip()
+    ki = optimized_result.get("keyword_intelligence", {}) or {}
 
-    def score_description(description):
-        text = str(description or '').strip()
-        if not text: return 0
-        return 10 if len(text) >= 80 else 6
+    tw = words(title)
+    tn = normalize_text(title)
+    tag_norm = [normalize_text(t) for t in tags]
+    dn = normalize_text(description)
+    alln = " ".join([tn] + tag_norm + [dn])
 
-    current_title = current_listing.get('title', '')
-    current_tags = current_listing.get('tags', []) or []
-    current_description = current_listing.get('description', '')
-    optimized_title = optimized_result.get('recommended_title', '')
-    optimized_tags = optimized_result.get('recommended_tags', []) or []
-    optimized_description = optimized_result.get('recommended_description', '')
+    product_type = identity.get("product_type", "")
+    gems = identity.get("gemstones", []) or []
+    primary_gem = gems[0] if gems else ""
 
-    current_score = min(100, score_title(current_title) + score_tags(current_tags) + score_description(current_description))
-    optimized_score = min(100, score_title(optimized_title) + score_tags(optimized_tags) + score_description(optimized_description))
-    if validation_errors:
-        optimized_score = max(0, optimized_score - min(25, len(validation_errors) * 5))
+    # 1. Product identity = 15
+    ip, ir = 0, []
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn): ip += 5
+    else: ir.append("Target product type is missing from the optimized title.")
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", dn): ip += 3
+    else: ir.append("Target product type is missing from the description.")
+    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", tn): ip += 4
+    else: ir.append("Primary gemstone is missing from the title.")
+    if not primary_gem or re.search(r"\b" + re.escape(primary_gem) + r"\b", dn): ip += 3
+    else: ir.append("Primary gemstone is missing from the description.")
 
-    signals = market_signals.get('high_signal_phrases', []) if isinstance(market_signals, dict) else []
-    signal_count = len(signals)
-    improvement = optimized_score - current_score
+    # 2. Title = 15
+    tp, tr = 0, []
+    if title: tp += 3
+    if 8 <= len(tw) <= 15: tp += 3
+    elif 5 <= len(tw) <= 17: tp += 1
+    else: tr.append("Aim for roughly 8–15 readable words.")
+    if len(title) <= 140: tp += 2
+    else: tr.append("Title exceeds 140 characters.")
+    if tw and len(tw) == len(set(tw)): tp += 3
+    else: tr.append("Title repeats words.")
+    subjective = {"best","perfect","beautiful","unique","amazing","stunning","gorgeous","must","premium","luxury"}
+    if not subjective.intersection(tw): tp += 2
+    else: tr.append("Remove subjective sales language from the title.")
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", tn[:max(1, min(len(tn), 80))]): tp += 2
+    else: tr.append("Put the actual product type near the beginning.")
+
+    # 3. Tags = 20
+    gp, gr = 0, []
+    if len(tags) == 13: gp += 4
+    else: gr.append("Exactly 13 tags are required.")
+    if tags:
+        gp += round(4 * sum(len(t) <= 20 for t in tags) / len(tags))
+        if any(len(t) > 20 for t in tags): gr.append("Every tag must be 20 characters or fewer.")
+    unique_ratio = len(set(tag_norm)) / max(1, len(tag_norm))
+    gp += round(4 * unique_ratio)
+    if unique_ratio < 1: gr.append("Remove duplicate tags.")
+    protected = [normalize_text(x) for x in identity.get("protected_terms", []) if x]
+    relevant = sum(1 for t in tag_norm if any(p and (p in t or t in p) for p in protected))
+    gp += round(4 * relevant / max(1, len(tags)))
+    if tags and relevant / len(tags) < 0.5: gr.append("More tags should directly reinforce the actual product.")
+    first_words = [t.split()[0] for t in tag_norm if t.split()]
+    diversity = len(set(first_words)) / max(1, len(first_words))
+    gp += round(4 * min(1, diversity))
+    if diversity < 0.5: gr.append("Tag structures are too repetitive.")
+    gp = min(20, gp)
+
+    # 4. Keyword coverage = 15
+    kp, kr = 0, []
+    groups = [
+        ("primary_keywords", 6, 5),
+        ("secondary_keywords", 4, 5),
+        ("long_tail_keywords", 3, 3),
+        ("buyer_intent_keywords", 2, 2),
+    ]
+    for key, pts, take in groups:
+        vals = [normalize_text(x) for x in ki.get(key, []) if str(x).strip()]
+        if vals:
+            covered = sum(1 for k in vals[:take] if k and k in alln)
+            kp += round(pts * covered / min(take, len(vals)))
+        else:
+            kr.append(f"No {key.replace('_',' ')} were returned.")
+            kp += 1 if pts <= 3 else 0
+    kp = min(15, kp)
+    if kp < 12: kr.append("Important keyword groups are not sufficiently covered by the listing copy.")
+
+    # 5. Description = 15
+    dp, dr = 0, []
+    if description: dp += 3
+    first = re.split(r"(?<=[.!?])\s+", description, maxsplit=1)[0] if description else ""
+    fn = normalize_text(first)
+    if not product_type or re.search(r"\b" + re.escape(product_type) + r"s?\b", fn): dp += 3
+    else: dr.append("First sentence should clearly identify the product.")
+    if not primary_gem or primary_gem in fn: dp += 3
+    else: dr.append("First sentence should include the primary gemstone.")
+    if len(description) >= 250: dp += 2
+    elif len(description) >= 120: dp += 1
+    else: dr.append("Description is too short.")
+    detail_terms = ["material","size","stone","gemstone","design","wear","care","shipping","gift"]
+    dp += min(2, sum(1 for x in detail_terms if re.search(r"\b"+x+r"\b", dn)) // 2)
+    if not subjective.intersection(words(description)): dp += 1
+    else: dr.append("Avoid excessive subjective sales language.")
+    if len(description.split()) >= 80: dp += 3
+    else: dr.append("Add useful buyer information where the source listing supports it.")
+    dp = min(15, dp)
+
+    # 6. Category/attributes = 10
+    attrs = current_listing.get("attributes", []) or []
+    ar = optimized_result.get("attribute_recommendations", []) or []
+    ap, apr = 0, []
+    if current_listing.get("taxonomy_id"): ap += 4
+    else: apr.append("Category/taxonomy is not confirmed.")
+    if isinstance(attrs, list) and len(attrs) >= 4: ap += 4
+    elif isinstance(attrs, list) and len(attrs) >= 2: ap += 2; apr.append("Review additional relevant Etsy attributes.")
+    else: apr.append("Few/no source attributes are available.")
+    ap += 2 if ar else 1
+    ap = min(10, ap)
+
+    # 7. Buyer/conversion quality = 10
+    bp, br = 0, []
+    if len(description) >= 250: bp += 3
+    elif len(description) >= 120: bp += 2
+    if re.search(r"\b(size|dimension|length|mm|inch|inches)\b", dn): bp += 2
+    else: br.append("Add known size/dimensions if the source listing provides them.")
+    if re.search(r"\b(material|sterling|gold|silver|vermeil|gemstone|opal|spinel)\b", dn): bp += 2
+    else: br.append("Make supported material/gemstone information easy to find.")
+    if re.search(r"\b(gift|birthday|anniversary|wedding|holiday|present)\b", dn): bp += 1
+    else: br.append("Add a truthful gifting/use context when relevant.")
+    if not re.search(r"\b(heal|healing|cure|treat|medical)\b", alln): bp += 1
+    else: br.append("Remove medical/healing claims.")
+    if not validation_errors: bp += 1
+    else: br.append("Resolve hard validation errors.")
+    bp = min(10, bp)
+
+    total = min(100, ip + tp + gp + kp + dp + ap + bp)
+    sections = [
+        ("Product identity", ip, 15, ir),
+        ("Title", tp, 15, tr),
+        ("13 tags", gp, 20, gr),
+        ("Keyword coverage", kp, 15, kr),
+        ("Description", dp, 15, dr),
+        ("Category & attributes", ap, 10, apr),
+        ("Buyer/conversion quality", bp, 10, br),
+    ]
+    gaps = [{"section": n, "score": s, "max": m, "points_lost": m-s, "reasons": rs[:5]} for n,s,m,rs in sections if s < m]
     return {
-        'current_score': current_score,
-        'optimized_score': optimized_score,
-        'improvement': improvement,
-        'grade': 'A' if optimized_score >= 90 else 'B' if optimized_score >= 80 else 'C' if optimized_score >= 70 else 'D' if optimized_score >= 60 else 'E',
-        'market_signal_count': signal_count,
-        'breakdown': {
-            'title': {
-                'current': score_title(current_title),
-                'optimized': score_title(optimized_title),
-                'max': 70,
-            },
-            'tags': {
-                'current': score_tags(current_tags),
-                'optimized': score_tags(optimized_tags),
-                'max': 20,
-            },
-            'description': {
-                'current': score_description(current_description),
-                'optimized': score_description(optimized_description),
-                'max': 10,
-            },
+        "current_score": None,
+        "optimized_score": total,
+        "improvement": None,
+        "grade": "A+" if total == 100 else "A" if total >= 90 else "B" if total >= 80 else "C" if total >= 70 else "D" if total >= 60 else "E",
+        "is_genuine_100": total == 100,
+        "breakdown": {
+            "product_identity": {"optimized": ip, "max": 15},
+            "title": {"optimized": tp, "max": 15},
+            "tags": {"optimized": gp, "max": 20},
+            "keyword_coverage": {"optimized": kp, "max": 15},
+            "description": {"optimized": dp, "max": 15},
+            "attributes": {"optimized": ap, "max": 10},
+            "buyer_quality": {"optimized": bp, "max": 10},
         },
-        'note': 'Directional optimization score for structure, relevance and marketplace-signal usage. It is not an Etsy ranking prediction.'
+        "gaps": gaps,
+        "note": "Genuine internal SEO-quality score based on deterministic checks. It is not Etsy's ranking score.",
     }
 
 def rewrite_listing(candidate, similarity_matches, claim_problems):
@@ -2027,6 +2123,64 @@ Return ONLY valid JSON:
     raise RuntimeError(f"Optimizer AI response failed after 3 attempts: {type(last_error).__name__}: {last_error}")
 
 
+def improve_existing_listing_for_score(listing, optimized, score_report, identity, market_signals):
+    """Use Gemini to fix only deterministic score gaps; validator remains the authority."""
+    prompt = f"""
+Improve this existing Etsy listing to satisfy the deterministic SEO score gaps.
+
+SOURCE LISTING:
+{json.dumps({k: listing.get(k) for k in ["title","tags","description","materials","attributes","taxonomy_id"]}, ensure_ascii=False)}
+
+PRODUCT IDENTITY LOCK:
+{json.dumps(identity, ensure_ascii=False)}
+
+CURRENT RESULT:
+{json.dumps(optimized, ensure_ascii=False)}
+
+SCORE REPORT:
+{json.dumps(score_report, ensure_ascii=False)}
+
+MARKETPLACE SIGNALS:
+{json.dumps({"queries": market_signals.get("queries", [])[:3],
+"high_signal_phrases": (market_signals.get("high_signal_phrases", []) or [])[:10],
+"high_signal_tags": (market_signals.get("high_signal_tags", []) or [])[:10]}, ensure_ascii=False)}
+
+Fix the listed gaps without inventing facts.
+
+Rules:
+- Preserve exact product type and gemstones from the source.
+- Never introduce unrelated gemstones, metals, origins, treatments, certifications,
+  measurements, carat weights, or other unsupported facts.
+- Title <= 140 characters and preferably 8-15 words.
+- No subjective title fluff or keyword stuffing.
+- Exactly 13 tags, each <=20 characters, diverse and relevant.
+- First description sentence must clearly identify the actual product.
+- Do not make healing/medical claims.
+- Attribute recommendations may identify fields to verify, but never invent values.
+- Do not copy competitor wording.
+- If a missing fact prevents a perfect score, stay truthful rather than fabricate it.
+
+Return ONLY valid JSON:
+{{
+  "recommended_title": "...",
+  "recommended_tags": ["exactly 13 tags"],
+  "recommended_description": "...",
+  "keyword_strategy": [{{"keyword":"...","type":"primary|secondary|long-tail|buyer-intent","signal":"strong|medium|weak","reason":"..."}}],
+  "keyword_intelligence": {{
+    "primary_keywords": ["..."],
+    "secondary_keywords": ["..."],
+    "long_tail_keywords": ["..."],
+    "buyer_intent_keywords": ["..."],
+    "avoid_keywords": ["..."]
+  }},
+  "attribute_recommendations": ["..."],
+  "changes_summary": ["..."],
+  "search_volume_note": "Exact Etsy search volume is not available through the API; marketplace signals are directional."
+}}
+"""
+    response = ai_response_create(input_data=prompt, max_output_tokens=3200)
+    return parse_listing_json(response.output_text)
+
 @app.get("/optimizer", response_class=HTMLResponse)
 def optimizer_page(listing_id: str = Query("")):
     """Human-friendly UI for the existing Etsy listing SEO optimizer.
@@ -2146,12 +2300,13 @@ def optimizer_page(listing_id: str = Query("")):
       <div class="card full">
         <div class="section-title"><h2>📈 SEO Score & Comparison</h2></div>
         <div class="score-grid">
-          <div class="score-box"><strong>CURRENT SCORE</strong><span id="currentScore">—</span></div>
-          <div class="score-box"><strong>OPTIMIZED SCORE</strong><span id="optimizedScore">—</span></div>
-          <div class="score-box"><strong>IMPROVEMENT</strong><span id="improvement">—</span></div>
+          <div class="score-box"><strong>GENUINE SEO SCORE</strong><span id="optimizedScore">—</span></div>
+          <div class="score-box"><strong>STATUS</strong><span id="scoreStatus">—</span></div>
+          <div class="score-box"><strong>IMPROVEMENT ROUNDS</strong><span id="improvementRounds">—</span></div>
           <div class="score-box"><strong>GRADE</strong><span id="grade">—</span></div>
         </div>
         <p id="scoreNote" class="muted"></p>
+        <div id="scoreGaps" class="muted"></div>
       </div>
       <div class="card full">
         <div class="section-title"><h2>🧠 SEO Intelligence Breakdown</h2></div>
@@ -2211,9 +2366,10 @@ function render(data) {
   $('compareCurrentTitle').textContent=data.current_listing?.title||''; $('compareOptimizedTitle').textContent=latest.title||'';
   const curTags=data.current_listing?.tags||[]; $('compareCurrentTags').innerHTML=''; curTags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareCurrentTags').appendChild(s);});
   $('compareOptimizedTags').innerHTML=''; latest.tags.forEach((tag,i)=>{const s=document.createElement('span');s.className='tag';s.textContent=`${i+1}. ${tag}`;$('compareOptimizedTags').appendChild(s);});
-  const sc=data.seo_score||{}; $('currentScore').textContent=(sc.current_score ?? '—')+'/100'; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('improvement').textContent=(sc.improvement>=0?'+':'')+(sc.improvement ?? '—'); $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
+  const sc=data.seo_score||{}; $('optimizedScore').textContent=(sc.optimized_score ?? '—')+'/100'; $('scoreStatus').textContent=sc.is_genuine_100?'100/100 ✓':'Needs improvement'; $('improvementRounds').textContent=sc.improvement_rounds ?? '—'; $('grade').textContent=sc.grade||'—'; $('scoreNote').textContent=sc.note||'';
+  const gaps=sc.gaps||[]; $('scoreGaps').innerHTML=gaps.length ? '<b>Points still missing:</b> '+gaps.map(g=>`${g.section}: ${g.points_lost} — ${(g.reasons||[]).join('; ')}`).join(' | ') : '<span class="success"><b>100/100 — all measurable checks passed.</b></span>';
   const bd=sc.breakdown||{};
-  const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; $(el).textContent=(val ?? '—'); $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
+  const setBreak=(key,el,bar)=>{const x=bd[key]||{}; const val=x.optimized; const max=x.max||1; if($(el)) $(el).textContent=(val ?? '—'); if($(bar)) $(bar).style.width=(val==null?'0':Math.max(0,Math.min(100,(val/max)*100)))+'%';};
   setBreak('title','titleBreak','titleBar'); setBreak('tags','tagsBreak','tagsBar'); setBreak('description','descBreak','descBar');
   $('keywords').innerHTML=''; (o.keyword_strategy||[]).forEach(item=>{const d=document.createElement('div');d.className='keyword';const b=document.createElement('b');b.textContent=item.keyword||'';const meta=document.createElement('span');meta.textContent=`${(item.type||'keyword').toUpperCase()} • ${(item.signal||'signal').toUpperCase()}`;const sp=document.createElement('span');sp.textContent=item.reason||'';d.appendChild(b);d.appendChild(meta);d.appendChild(sp);$('keywords').appendChild(d);});
   const ki=o.keyword_intelligence||{};
@@ -2301,25 +2457,71 @@ async def analyze_existing_listing(
         }
 
     optimized = optimize_existing_listing(listing, market_signals)
+    identity = extract_product_identity(listing)
 
-    # Validate the proposed title/tags using the same hard constraints as the
-    # listing generator, without touching Etsy.
-    candidate = {
-        "title": optimized.get("recommended_title", ""),
-        "tags": optimized.get("recommended_tags", []),
-        "description": optimized.get("recommended_description", ""),
-    }
-    validation_errors = validate_listing(candidate)
+    # Up to 3 deterministic validation/improvement rounds. Gemini suggests edits;
+    # the score is always calculated by the rules above.
+    score_history = []
+    best = optimized
+    best_score = -1
+    best_errors = []
+
+    for round_no in range(3):
+        candidate = {
+            "title": optimized.get("recommended_title", ""),
+            "tags": optimized.get("recommended_tags", []),
+            "description": optimized.get("recommended_description", ""),
+        }
+        hard_errors = validate_listing(candidate)
+        identity_errors = validate_product_identity(optimized, identity)
+        all_errors = list(dict.fromkeys(hard_errors + identity_errors))
+
+        score = seo_score_report(
+            {
+                "title": listing.get("title", ""),
+                "tags": listing.get("tags", []) or [],
+                "description": listing.get("description", ""),
+                "attributes": listing.get("attributes", []) or [],
+                "taxonomy_id": listing.get("taxonomy_id"),
+            },
+            optimized,
+            market_signals,
+            all_errors,
+            identity,
+        )
+        score_history.append(score["optimized_score"])
+
+        if score["optimized_score"] > best_score:
+            best_score = score["optimized_score"]
+            best = optimized
+            best_errors = all_errors
+
+        if score["is_genuine_100"]:
+            break
+        if round_no == 2:
+            break
+
+        optimized = improve_existing_listing_for_score(
+            listing, optimized, score, identity, market_signals
+        )
+
+    optimized = best
+    validation_errors = best_errors
     seo_score = seo_score_report(
         {
             "title": listing.get("title", ""),
             "tags": listing.get("tags", []) or [],
             "description": listing.get("description", ""),
+            "attributes": listing.get("attributes", []) or [],
+            "taxonomy_id": listing.get("taxonomy_id"),
         },
         optimized,
         market_signals,
         validation_errors,
+        identity,
     )
+    seo_score["improvement_rounds"] = len(score_history) - 1
+    seo_score["score_history"] = score_history
 
     return {
         "status": "success" if not validation_errors else "validation_failed",
@@ -2341,6 +2543,7 @@ async def analyze_existing_listing(
         "optimized_result": optimized,
         "seo_score": seo_score,
         "validation_errors": validation_errors,
+        "product_identity": identity,
         "write_action_performed": False,
     }
 
