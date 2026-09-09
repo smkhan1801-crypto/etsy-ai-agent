@@ -885,49 +885,51 @@ def _extract_balanced_json_object(text):
 
 
 def parse_listing_json(text):
-    """Strict JSON parser with safe extraction for Gemini wrappers."""
+    """Parse Gemini output into the optimizer's required JSON object."""
     cleaned = clean_json_text(text)
-
     if not cleaned:
         raise ValueError("AI returned an empty JSON response.")
 
-    # Fast path.
+    def as_object(data):
+        if isinstance(data, dict):
+            return data
+        # Gemini sometimes emits [{"...": ...}] even in JSON mode.
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+            return data[0]
+        return None
+
     try:
         data = json.loads(cleaned)
-        if not isinstance(data, dict):
-            raise ValueError("AI listing result is not an object.")
-        return data
-    except json.JSONDecodeError as first_error:
-        pass
+        obj = as_object(data)
+        if obj is not None:
+            return obj
+        shape_error = f"unsupported JSON shape: {type(data).__name__}"
+    except json.JSONDecodeError as exc:
+        shape_error = f"invalid JSON syntax: {exc}"
 
-    # Robust path: extract the first balanced object instead of using a greedy
-    # {.*} regex, which breaks when Gemini returns multiple JSON-like blocks.
     candidate = _extract_balanced_json_object(cleaned)
     if candidate:
         try:
             data = json.loads(candidate)
-            if not isinstance(data, dict):
-                raise ValueError("AI listing result is not an object.")
-            return data
+            obj = as_object(data)
+            if obj is not None:
+                return obj
         except json.JSONDecodeError:
             pass
 
-    # Last safe cleanup for a frequent model artifact: a trailing comma before
-    # } or ]. This does not invent content and is limited to JSON punctuation.
-    if candidate:
         repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
         try:
             data = json.loads(repaired)
-            if not isinstance(data, dict):
-                raise ValueError("AI listing result is not an object.")
-            return data
+            obj = as_object(data)
+            if obj is not None:
+                return obj
         except json.JSONDecodeError:
             pass
 
-    preview = cleaned[:500].replace("\n", " ")
+    preview = cleaned[:700].replace("\n", " ")
     raise ValueError(
-        "AI did not return valid JSON. "
-        f"Response preview: {preview}"
+        "AI listing result is not a JSON object. "
+        f"{shape_error}. Response preview: {preview}"
     )
 
 def generate_listing(product, details, seller_claims="", keyword_signals=None):
@@ -1033,13 +1035,11 @@ def ai_response_create(*, input_data, max_output_tokens=3000):
     except ValueError:
         raw = response.output_text or ""
         repair_prompt = f"""
-Convert the following model output into ONE valid JSON object.
-
-Return ONLY valid JSON.
+Convert the following model output into ONE valid JSON OBJECT matching the requested listing schema.
+Return ONLY one JSON object, never an array, scalar, Markdown fence, or commentary.
+If the input is a one-item array containing an object, unwrap that object.
 Do not add, remove, or invent product facts.
 Preserve the existing values exactly where possible.
-Do not use Markdown fences.
-Do not add commentary.
 
 MODEL OUTPUT:
 {raw}
