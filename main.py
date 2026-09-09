@@ -2654,7 +2654,7 @@ def optimizer_page(listing_id: str = Query("")):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer — V9</title>
+<title>Etsy AI SEO Optimizer — V10</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -3023,7 +3023,7 @@ async def analyze_existing_listing(
             optimized["_keyword_gap_instruction"] = (
                 "EXACT SUPPORTED PHRASES STILL MISSING. Incorporate these naturally "
                 "where factual and within Etsy limits: "
-                + " | ".join(dict.fromkeys(keyword_gap_phrases)[:8])
+                + " | ".join(list(dict.fromkeys(keyword_gap_phrases))[:8])
             )
 
     optimized = best
