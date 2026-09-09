@@ -15,7 +15,7 @@ import redis
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
 from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 app = FastAPI()
 
@@ -32,7 +32,8 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         },
     )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=25, max_retries=1)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=25, max_retries=0)
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
 ETSY_KEYSTRING = os.getenv("ETSY_API_KEYSTRING")
 ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET")
@@ -835,11 +836,32 @@ Return ONLY valid JSON with exactly this structure:
 """
 
     response = client.responses.create(
-        model="gpt-5.6-luna",
+        model=AI_MODEL,
         input=prompt,
     )
 
     return parse_listing_json(response.output_text)
+
+
+# -------------------------------------------------------------------
+# OPENAI REQUEST HELPERS
+# -------------------------------------------------------------------
+
+def ai_response_create(*, input_data, max_output_tokens=3000):
+    """Call OpenAI without multiplying rate-limit usage on 429 errors."""
+    try:
+        return client.responses.create(
+            model=AI_MODEL,
+            input=input_data,
+            max_output_tokens=max_output_tokens,
+        )
+    except RateLimitError as exc:
+        raise RuntimeError(
+            "OpenAI API rate limit reached. The optimizer stopped immediately "
+            "instead of retrying and consuming more tokens. Please wait for the "
+            "limit to reset, or raise the API rate limit/usage tier. "
+            f"Original error: {exc}"
+        ) from exc
 
 
 # -------------------------------------------------------------------
@@ -1245,7 +1267,7 @@ Rules:
 """
 
     response = client.responses.create(
-        model="gpt-5.6-luna",
+        model=AI_MODEL,
         input=prompt,
     )
 
@@ -1313,7 +1335,7 @@ Return a concise analysis covering:
 """
 
     analysis_response = client.responses.create(
-        model="gpt-5.6-luna",
+        model=AI_MODEL,
         input=[
             {
                 "role": "user",
@@ -1823,6 +1845,15 @@ def optimize_existing_listing(listing, market_signals):
         "taxonomy_id": listing.get("taxonomy_id"),
     }
 
+    # Keep the AI context compact. Competitor samples are useful for the UI,
+    # but the model only needs the strongest keyword signals for optimization.
+    compact_market_signals = {
+        "queries": market_signals.get("queries", [])[:3],
+        "marketplace_results_checked": market_signals.get("marketplace_results_checked", 0),
+        "high_signal_phrases": (market_signals.get("high_signal_phrases", []) or [])[:12],
+        "high_signal_tags": (market_signals.get("high_signal_tags", []) or [])[:12],
+    }
+
     prompt = f"""
 You are an elite Etsy SEO and conversion strategist specializing in handmade
 Gemstone Jewelry. You are optimizing an EXISTING Etsy listing, not creating a
@@ -1835,7 +1866,7 @@ NON-NEGOTIABLE PRODUCT IDENTITY (SOURCE OF TRUTH):
 {json.dumps(identity, ensure_ascii=False)}
 
 MARKETPLACE RESEARCH SIGNALS:
-{json.dumps(market_signals, ensure_ascii=False)}
+{json.dumps(compact_market_signals, ensure_ascii=False)}
 
 INTERPRETATION:
 - Give more weight to keywords with stronger signal_score, higher frequency, and wider query coverage.
@@ -1924,9 +1955,9 @@ Return ONLY valid JSON:
     last_identity_errors = []
     for attempt in range(3):
         try:
-            response = client.responses.create(
-                model="gpt-5.6-luna",
-                input=prompt,
+            response = ai_response_create(
+                input_data=prompt,
+                max_output_tokens=3200,
             )
             text = getattr(response, "output_text", "") or ""
             result = parse_listing_json(text)
@@ -1937,6 +1968,13 @@ Return ONLY valid JSON:
 
             last_identity_errors = identity_errors
             prompt = prompt + "\n\nIDENTITY VALIDATION FAILED. You must regenerate the entire JSON. Fix these exact errors:\n- " + "\n- ".join(identity_errors) + "\nDo not change the target product, gemstone, or supported facts. Return ONLY valid JSON."
+        except RuntimeError as exc:
+            last_error = exc
+            # Rate-limit failures are deliberately not retried. Retrying a 429
+            # only burns more quota and makes the situation worse.
+            if "OpenAI API rate limit reached" in str(exc):
+                raise
+            prompt = prompt + "\n\nFINAL REMINDER: Return ONLY one compact JSON object. No markdown, no commentary, no code fences. Ensure all JSON strings escape newlines and quotes correctly."
         except Exception as exc:
             last_error = exc
             prompt = prompt + "\n\nFINAL REMINDER: Return ONLY one compact JSON object. No markdown, no commentary, no code fences. Ensure all JSON strings escape newlines and quotes correctly."
