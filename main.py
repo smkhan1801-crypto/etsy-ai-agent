@@ -278,28 +278,50 @@ def etsy_public_headers():
     }
 
 
+def _etsy_response_is_transient(response):
+    return response.status_code in {429, 500, 502, 503, 504}
+
+
+def _etsy_retry_delay(response, attempt):
+    retry_after = response.headers.get("Retry-After")
+    try:
+        if retry_after:
+            return min(max(float(retry_after), 0.5), 8.0)
+    except (TypeError, ValueError):
+        pass
+    return min(0.8 * (2 ** attempt), 8.0)
+
+
 def etsy_get(url, access_token=None, params=None):
-    headers = etsy_headers(access_token) if access_token else etsy_public_headers()
+    """GET Etsy with bounded retry/backoff for transient gateway/rate-limit errors."""
+    last_response = None
+    for attempt in range(4):
+        headers = etsy_headers(access_token) if access_token else etsy_public_headers()
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=20)
+        except requests.RequestException as exc:
+            if attempt >= 3:
+                raise HTTPException(status_code=503, detail=f"Etsy API connection failed after retries: {exc}")
+            time.sleep(min(0.8 * (2 ** attempt), 8.0))
+            continue
 
-    response = requests.get(
-        url,
-        headers=headers,
-        params=params,
-        timeout=12,
-    )
+        last_response = response
 
-    if access_token and response.status_code == 401:
-        refreshed = refresh_etsy_token()
-        if refreshed:
-            new_access_token = refreshed.get("access_token")
-            response = requests.get(
-                url,
-                headers=etsy_headers(new_access_token),
-                params=params,
-                timeout=12,
-            )
+        if access_token and response.status_code == 401:
+            refreshed = refresh_etsy_token()
+            if refreshed:
+                access_token = refreshed.get("access_token")
+                continue
 
-    return response
+        if not _etsy_response_is_transient(response):
+            return response
+
+        if attempt < 3:
+            time.sleep(_etsy_retry_delay(response, attempt))
+            continue
+        return response
+
+    return last_response
 
 
 
@@ -1853,7 +1875,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. V11 scores keyword coverage only "
+            "It is not Etsy's ranking score. V19 scores keyword coverage only "
             "against source/listing evidence or marketplace signals and never "
             "treats unavailable Etsy metadata as a failure."
         ),
@@ -3183,10 +3205,17 @@ async def analyze_existing_listing(
     )
 
     if not response.ok:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=response.text,
-        )
+        if response.status_code in {429, 500, 502, 503, 504}:
+            raise HTTPException(
+                status_code=503,
+                detail="Etsy API is temporarily unavailable (gateway/rate-limit response). The optimizer retried automatically. Please try Analyze again in a moment.",
+            )
+        try:
+            error_payload = response.json()
+            detail = error_payload.get("error") or error_payload.get("message") or str(error_payload)
+        except ValueError:
+            detail = f"Etsy API returned HTTP {response.status_code}."
+        raise HTTPException(status_code=response.status_code, detail=detail)
 
     listing = response.json()
 
