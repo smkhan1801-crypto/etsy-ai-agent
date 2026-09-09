@@ -830,31 +830,105 @@ def market_keyword_research(seed_text):
 # -------------------------------------------------------------------
 
 def clean_json_text(text):
-    text = text.strip()
+    """Normalize common Gemini JSON wrappers without changing the payload."""
+    if text is None:
+        return ""
+    text = str(text).replace("\ufeff", "").strip()
 
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text, flags=re.I).strip()
-        text = re.sub(r"```$", "", text).strip()
+    # Remove Markdown fences if Gemini ignored response_mime_type.
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```\s*$", "", text).strip()
 
+    # Remove a leading JSON label sometimes emitted by a model.
+    text = re.sub(r"^\s*(?:json|JSON)\s*:\s*", "", text).strip()
     return text
 
 
+def _extract_balanced_json_object(text):
+    """Extract the first complete JSON object/array while respecting quoted strings."""
+    if not text:
+        return None
+
+    starts = [i for i, ch in enumerate(text) if ch in "{["]
+    for start_i in starts:
+        opener = text[start_i]
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for i in range(start_i, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    return text[start_i:i + 1]
+            elif opener == "{" and ch == "]":
+                break
+            elif opener == "[" and ch == "}":
+                break
+
+    return None
+
+
 def parse_listing_json(text):
+    """Strict JSON parser with safe extraction for Gemini wrappers."""
     cleaned = clean_json_text(text)
 
+    if not cleaned:
+        raise ValueError("AI returned an empty JSON response.")
+
+    # Fast path.
     try:
         data = json.loads(cleaned)
-    except Exception:
-        match = re.search(r"\{.*\}", cleaned, flags=re.S)
-        if not match:
-            raise ValueError("AI did not return valid JSON.")
-        data = json.loads(match.group(0))
+        if not isinstance(data, dict):
+            raise ValueError("AI listing result is not an object.")
+        return data
+    except json.JSONDecodeError as first_error:
+        pass
 
-    if not isinstance(data, dict):
-        raise ValueError("AI listing result is not an object.")
+    # Robust path: extract the first balanced object instead of using a greedy
+    # {.*} regex, which breaks when Gemini returns multiple JSON-like blocks.
+    candidate = _extract_balanced_json_object(cleaned)
+    if candidate:
+        try:
+            data = json.loads(candidate)
+            if not isinstance(data, dict):
+                raise ValueError("AI listing result is not an object.")
+            return data
+        except json.JSONDecodeError:
+            pass
 
-    return data
+    # Last safe cleanup for a frequent model artifact: a trailing comma before
+    # } or ]. This does not invent content and is limited to JSON punctuation.
+    if candidate:
+        repaired = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        try:
+            data = json.loads(repaired)
+            if not isinstance(data, dict):
+                raise ValueError("AI listing result is not an object.")
+            return data
+        except json.JSONDecodeError:
+            pass
 
+    preview = cleaned[:500].replace("\n", " ")
+    raise ValueError(
+        "AI did not return valid JSON. "
+        f"Response preview: {preview}"
+    )
 
 def generate_listing(product, details, seller_claims="", keyword_signals=None):
     keyword_signals = keyword_signals or []
@@ -941,12 +1015,43 @@ Return ONLY valid JSON with exactly this structure:
 # -------------------------------------------------------------------
 
 def ai_response_create(*, input_data, max_output_tokens=3000):
-    """Generate optimizer output with Gemini Free Tier."""
-    return gemini_generate_text(
+    """Generate optimizer output with Gemini Free Tier.
+
+    Gemini is requested to return application/json. If a provider/model still
+    returns malformed JSON, make one constrained repair call instead of crashing
+    the whole optimizer.
+    """
+    response = gemini_generate_text(
         input_data,
         max_output_tokens=max_output_tokens,
         json_mode=True,
     )
+
+    try:
+        parse_listing_json(response.output_text)
+        return response
+    except ValueError:
+        raw = response.output_text or ""
+        repair_prompt = f"""
+Convert the following model output into ONE valid JSON object.
+
+Return ONLY valid JSON.
+Do not add, remove, or invent product facts.
+Preserve the existing values exactly where possible.
+Do not use Markdown fences.
+Do not add commentary.
+
+MODEL OUTPUT:
+{raw}
+"""
+        repaired = gemini_generate_text(
+            repair_prompt,
+            max_output_tokens=max_output_tokens,
+            json_mode=True,
+        )
+        # Fail with a useful error if even the constrained repair is invalid.
+        parse_listing_json(repaired.output_text)
+        return repaired
 
 
 # -------------------------------------------------------------------
