@@ -19,6 +19,13 @@ from google import genai
 from google.genai import types
 
 app = FastAPI()
+APP_VERSION = "V23-EMERGENCY-FALLBACK"
+
+@app.middleware("http")
+async def add_version_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Etsy-AI-Version"] = APP_VERSION
+    return response
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
@@ -3229,7 +3236,7 @@ def optimizer_page(listing_id: str = Query("")):
 <body>
 <div class="wrap">
   <div class="hero">
-    <h1>🚀 Etsy AI SEO Optimizer</h1>
+    <h1>🚀 Etsy AI SEO Optimizer <span class="muted" style="font-size:12px">V23</span></h1>
     <p class="sub">Analyze an existing Etsy listing and get a buyer-friendly title, 13 SEO tags, optimized description and keyword strategy. Review the changes, then apply them directly to Etsy.</p>
   </div>
   <div class="card">
@@ -3493,21 +3500,25 @@ async def analyze_existing_listing(
 
     identity = extract_product_identity(listing)
     emergency_fallback = False
+    provider_error = None
     try:
         optimized = optimize_existing_listing(listing, market_signals)
+        # Tag repair is deterministic, but keep it inside the guard so a malformed
+        # AI payload can never escape the emergency continuity path.
+        optimized = repair_optimized_tags(optimized, listing, market_signals, identity)
     except Exception as exc:
-        # Never block the user's workflow just because all AI providers are down.
-        # Etsy remains read-only in this endpoint; the emergency result is conservative
-        # and explicitly marked so it cannot be mistaken for a full AI optimization.
+        # HARD CONTINUITY GUARANTEE: provider failures must never make this endpoint
+        # return the old "All configured AI providers..." error. Etsy remains read-only.
         emergency_fallback = True
+        provider_error = str(exc)
         optimized = emergency_deterministic_optimizer(listing, market_signals)
         optimized["provider_warning"] = (
             "AI providers are temporarily unavailable. Emergency deterministic SEO "
             "continuity mode was used. Nothing was changed on Etsy. Provider error: "
-            + str(exc)
+            + provider_error
         )
-
-    optimized = repair_optimized_tags(optimized, listing, market_signals, identity)
+        # Emergency output itself must be safe even if marketplace research is empty.
+        optimized = repair_optimized_tags(optimized, listing, market_signals, identity)
 
     # Up to 5 targeted deterministic validation/improvement rounds. AI suggests edits;
     # the score is always calculated by the rules above.
@@ -3602,6 +3613,7 @@ async def analyze_existing_listing(
     seo_score["score_history"] = score_history
 
     return {
+        "app_version": APP_VERSION,
         "status": "success" if not validation_errors else "validation_failed",
         "message": (
             "Existing Etsy listing analyzed. Nothing was edited, created, or published."
