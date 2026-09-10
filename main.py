@@ -245,7 +245,7 @@ def home():
         "mode": "existing_listing_seo_optimizer",
         "optimizer_ui": "/optimizer",
         "docs": "/docs",
-        "ai_backend": "Gemini primary + OpenAI fallback",
+        "ai_backend": "Gemini primary + OpenAI fallback + deterministic emergency fallback",
         "ai_model": GEMINI_MODEL,
         "ai_fallback_models": GEMINI_FALLBACK_MODELS,
         "openai_fallback_enabled": bool(OPENAI_API_KEY),
@@ -2671,6 +2671,188 @@ def repair_optimized_tags(optimized, listing, market_signals, identity):
     return optimized
 
 
+
+# -------------------------------------------------------------------
+# EMERGENCY DETERMINISTIC SEO FALLBACK
+# -------------------------------------------------------------------
+
+GENERIC_FALLBACK_WORDS = {
+    "handmade", "jewelry", "jewellery", "gift", "gifts", "women", "woman",
+    "men", "mens", "beautiful", "elegant", "natural", "genuine", "authentic",
+    "unique", "stone", "gemstone", "piece", "pieces", "fashion", "style",
+    "for", "and", "the", "with", "from", "this", "that", "your", "new",
+}
+
+
+def _fallback_tag_candidates(listing, identity, market_signals):
+    """Create truthful buyer-language tags without any AI provider.
+
+    This is intentionally conservative: it only uses words/phrases already
+    present in the target listing or marketplace signals that are compatible
+    with the target product identity. It is a continuity fallback, not a claim
+    that it can replace the full AI optimizer.
+    """
+    source_title = str(listing.get("title", "") or "")
+    source_desc = str(listing.get("description", "") or "")
+    source_tags = [str(x).strip() for x in (listing.get("tags", []) or []) if str(x).strip()]
+    source_text = normalize_text(" ".join([source_title, source_desc, *source_tags]))
+    product_type = identity.get("product_type", "")
+    gemstones = identity.get("gemstones", []) or []
+    primary_gem = gemstones[0] if gemstones else ""
+
+    candidates = []
+    def add(value):
+        value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.-")
+        if not value or len(value) > 20:
+            return
+        n = normalize_text(value)
+        if not n or n in {normalize_text(x) for x in candidates}:
+            return
+        # A tag must be grounded in the source listing or compatible market evidence.
+        candidates.append(value)
+
+    # Existing tags are the strongest safe continuity source.
+    for tag in source_tags:
+        add(tag)
+
+    # High-signal marketplace phrases only when they contain target identity terms.
+    identity_terms = [product_type] + gemstones[:3]
+    identity_words = set()
+    for term in identity_terms:
+        identity_words.update(normalize_text(term).split())
+
+    for row in (market_signals.get("high_signal_tags", []) or []):
+        kw = str(row.get("keyword", "")).strip()
+        kw_words = set(normalize_text(kw).split())
+        if identity_words.intersection(kw_words) or product_type in normalize_text(kw) or any(g in normalize_text(kw) for g in gemstones):
+            add(kw)
+
+    for row in (market_signals.get("high_signal_phrases", []) or []):
+        kw = str(row.get("keyword", "")).strip()
+        kw_words = set(normalize_text(kw).split())
+        if identity_words.intersection(kw_words) or product_type in normalize_text(kw) or any(g in normalize_text(kw) for g in gemstones):
+            add(kw)
+
+    # Construct conservative long-tail phrases from facts already in the source.
+    if primary_gem and product_type:
+        add(f"{primary_gem} {product_type}")
+        add(f"{primary_gem} {product_type} jewelry")
+    if len(gemstones) > 1 and product_type:
+        add(f"{gemstones[0]} {gemstones[1]}")
+        add(f"{gemstones[0]} {gemstones[1]} {product_type}")
+    if product_type:
+        add(f"handmade {product_type}")
+    if primary_gem:
+        add(f"{primary_gem} jewelry")
+
+    # Mine useful 2-word phrases from the source title.
+    title_words = [w for w in words(source_title) if len(w) >= 3]
+    for i in range(len(title_words) - 1):
+        a, b = title_words[i], title_words[i + 1]
+        if a in GENERIC_FALLBACK_WORDS and b in GENERIC_FALLBACK_WORDS:
+            continue
+        phrase = f"{a} {b}"
+        if any(t in normalize_text(phrase) for t in identity_terms if t):
+            add(phrase)
+
+    # Fill from source words paired with product identity, but never invent a claim.
+    source_words = []
+    for w in title_words + words(source_desc):
+        if len(w) >= 3 and w not in GENERIC_FALLBACK_WORDS and w not in source_words:
+            source_words.append(w)
+    for w in source_words:
+        if primary_gem and w != normalize_text(primary_gem):
+            add(f"{w} {primary_gem}")
+        if len(candidates) >= 13:
+            break
+
+    # Final safe pass from existing tags; then source single terms.
+    for tag in source_tags:
+        add(tag)
+        if len(candidates) >= 13:
+            break
+    for w in source_words:
+        add(w)
+        if len(candidates) >= 13:
+            break
+
+    return candidates[:13]
+
+
+def emergency_deterministic_optimizer(listing, market_signals):
+    """Return a safe SEO continuity result when every AI provider is down."""
+    identity = extract_product_identity(listing)
+    title = re.sub(r"\s+", " ", str(listing.get("title", "") or "")).strip()
+    tags = _fallback_tag_candidates(listing, identity, market_signals)
+
+    # Preserve the original description rather than hallucinating facts. Add a
+    # short factual opening only when the existing description does not clearly
+    # identify the product type and primary gemstone.
+    description = str(listing.get("description", "") or "").strip()
+    product_type = identity.get("product_type", "")
+    primary_gem = (identity.get("gemstones", []) or [""])[0]
+    opening_bits = [x for x in [primary_gem, product_type] if x]
+    if opening_bits and description:
+        normalized_desc = normalize_text(description)
+        identity_open = " ".join(opening_bits)
+        if product_type and product_type not in normalized_desc:
+            description = f"This {identity_open} is designed for buyers looking for the stated gemstone and jewelry style.\n\n{description}"
+    elif opening_bits:
+        description = f"This {identity_open} is the item shown in this Etsy listing."
+
+    # If the source has fewer than 13 usable tags, derive conservative tags from
+    # source facts. If still short, keep only truthful source words; do not fake tags.
+    if len(tags) < 13:
+        for tag in listing.get("tags", []) or []:
+            tag = str(tag).strip()
+            if tag and len(tag) <= 20 and normalize_text(tag) not in {normalize_text(x) for x in tags}:
+                tags.append(tag)
+            if len(tags) >= 13:
+                break
+    if len(tags) < 13:
+        for w in words(title):
+            if len(w) >= 3 and w not in GENERIC_FALLBACK_WORDS:
+                if w not in {normalize_text(x) for x in tags} and len(w) <= 20:
+                    tags.append(w)
+            if len(tags) >= 13:
+                break
+
+    # Keep exactly 13 only if possible. Etsy requires 13 tags for this optimizer.
+    if len(tags) < 13:
+        # Duplicate-free source tokens from the description as a last truthful fallback.
+        for w in words(description):
+            if len(w) >= 3 and w not in GENERIC_FALLBACK_WORDS and len(w) <= 20:
+                if w not in {normalize_text(x) for x in tags}:
+                    tags.append(w)
+            if len(tags) >= 13:
+                break
+
+    result = {
+        "current_listing_analysis": {
+            "strengths": ["Preserves the existing Etsy product identity and factual content."],
+            "weaknesses": ["Full AI keyword refinement is temporarily unavailable because configured AI providers are unavailable."],
+            "seo_opportunities": ["Run the full AI analysis again after provider availability returns for deeper marketplace-language optimization."],
+        },
+        "recommended_title": title[:140],
+        "recommended_tags": tags[:13],
+        "recommended_description": description,
+        "keyword_strategy": [],
+        "keyword_intelligence": {
+            "primary_keywords": [x for x in [primary_gem, product_type] if x],
+            "secondary_keywords": [],
+            "long_tail_keywords": [x for x in tags[:5] if " " in x],
+            "buyer_intent_keywords": [],
+            "avoid_keywords": [],
+        },
+        "attribute_recommendations": [],
+        "changes_summary": ["Emergency continuity mode: preserved source facts and generated conservative evidence-based tags."],
+        "search_volume_note": "Exact Etsy search volume is not available through the API; marketplace signals are directional.",
+        "product_identity_lock": identity,
+        "emergency_fallback": True,
+    }
+    return result
+
+
 def optimize_existing_listing(listing, market_signals):
     identity = extract_product_identity(listing)
     current = {
@@ -3309,11 +3491,25 @@ async def analyze_existing_listing(
             "research_warning": str(exc),
         }
 
-    optimized = optimize_existing_listing(listing, market_signals)
     identity = extract_product_identity(listing)
+    emergency_fallback = False
+    try:
+        optimized = optimize_existing_listing(listing, market_signals)
+    except Exception as exc:
+        # Never block the user's workflow just because all AI providers are down.
+        # Etsy remains read-only in this endpoint; the emergency result is conservative
+        # and explicitly marked so it cannot be mistaken for a full AI optimization.
+        emergency_fallback = True
+        optimized = emergency_deterministic_optimizer(listing, market_signals)
+        optimized["provider_warning"] = (
+            "AI providers are temporarily unavailable. Emergency deterministic SEO "
+            "continuity mode was used. Nothing was changed on Etsy. Provider error: "
+            + str(exc)
+        )
+
     optimized = repair_optimized_tags(optimized, listing, market_signals, identity)
 
-    # Up to 5 targeted deterministic validation/improvement rounds. Gemini suggests edits;
+    # Up to 5 targeted deterministic validation/improvement rounds. AI suggests edits;
     # the score is always calculated by the rules above.
     score_history = []
     best = optimized
@@ -3358,6 +3554,8 @@ async def analyze_existing_listing(
             best_errors = all_errors
 
         if score["is_genuine_100"]:
+            break
+        if emergency_fallback:
             break
         if round_no == 5:
             break
@@ -3426,6 +3624,8 @@ async def analyze_existing_listing(
         "validation_errors": validation_errors,
         "product_identity": identity,
         "write_action_performed": False,
+        "ai_fallback_mode": "emergency_deterministic" if emergency_fallback else "full_ai",
+        "ai_fallback_warning": optimized.get("provider_warning") if emergency_fallback else None,
     }
 
 
