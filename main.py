@@ -34,15 +34,25 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 OPENAI_FALLBACK_MODELS = [m.strip() for m in os.getenv("OPENAI_FALLBACK_MODELS", "gpt-5.6-luna").split(",") if m.strip()]
+# Always include the current stable Flash pool. Environment overrides can add
+# models, but can no longer accidentally remove the newer fallback models.
 GEMINI_FALLBACK_MODELS = [
     m.strip() for m in os.getenv(
         "GEMINI_FALLBACK_MODELS",
-        "gemini-3.5-flash,gemini-3.1-flash-lite"
+        ""
     ).split(",") if m.strip()
+]
+GEMINI_BUILTIN_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
 ]
 
 _gemini_client = None
@@ -66,7 +76,7 @@ def _gemini_models_to_try():
     # Try the configured model first, then free-tier Flash fallbacks.
     seen = set()
     models = []
-    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+    for model in [GEMINI_MODEL, *GEMINI_BUILTIN_FALLBACK_MODELS, *GEMINI_FALLBACK_MODELS]:
         if model and model not in seen:
             seen.add(model)
             models.append(model)
@@ -83,7 +93,10 @@ def _gemini_generate_with_fallback(contents, config, purpose="text"):
     last_exc = None
     models = _gemini_models_to_try()
     for model in models:
-        for attempt in range(3):
+        # One retry per model is enough here because the pool itself provides
+        # redundancy. This avoids spending a long time hammering an overloaded
+        # model before moving to the next one.
+        for attempt in range(2):
             try:
                 response = get_gemini_client().models.generate_content(model=model, contents=contents, config=config)
                 text = getattr(response, "text", None) or ""
@@ -94,8 +107,8 @@ def _gemini_generate_with_fallback(contents, config, purpose="text"):
                 last_exc = exc
                 if not _is_gemini_transient_error(exc):
                     raise
-                if attempt < 2:
-                    time.sleep(1.5 * (2 ** attempt))
+                if attempt < 1:
+                    time.sleep(2.0)
     raise RuntimeError("Gemini is temporarily unavailable across the fallback pool. "
                        f"Tried: {', '.join(models)}. Last error: {type(last_exc).__name__}: {last_exc}")
 
@@ -137,6 +150,11 @@ def openai_generate_text(prompt, max_output_tokens=3000, json_mode=True):
                     raise RuntimeError("OpenAI returned an empty response.")
                 body = r.text[:1000]
                 last_exc = RuntimeError(f"OpenAI HTTP {r.status_code}: {body}")
+                # A 429 is quota/rate-limit state, not a transient network error.
+                # Retrying immediately only consumes more quota and can extend the
+                # cooldown. Let the Gemini pool remain the primary recovery path.
+                if r.status_code == 429:
+                    break
                 if not _is_openai_transient(r.status_code, body):
                     break
                 if attempt < 2: time.sleep(2.0 * (2 ** attempt))
@@ -231,6 +249,18 @@ def home():
         "ai_model": GEMINI_MODEL,
         "ai_fallback_models": GEMINI_FALLBACK_MODELS,
         "openai_fallback_enabled": bool(OPENAI_API_KEY),
+    }
+
+
+@app.get("/ai-health")
+def ai_health():
+    """Safe provider diagnostics; never exposes API keys."""
+    return {
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "gemini_primary": GEMINI_MODEL,
+        "gemini_fallback_pool": _gemini_models_to_try(),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "openai_fallback_pool": _openai_models_to_try(),
     }
 
 
