@@ -34,20 +34,15 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-# Built-in fallback pool is intentionally broader than the Render env defaults.
-# This prevents a temporary 503/high-demand event on one Flash model from taking
-# the whole optimizer down. These are current stable Gemini 3 Flash models.
-_BUILTIN_GEMINI_FALLBACK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3.1-flash-lite",
-]
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+OPENAI_FALLBACK_MODELS = [m.strip() for m in os.getenv("OPENAI_FALLBACK_MODELS", "gpt-5.6-luna").split(",") if m.strip()]
 GEMINI_FALLBACK_MODELS = [
-    m.strip() for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()
+    m.strip() for m in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        "gemini-3.5-flash,gemini-3.1-flash-lite"
+    ).split(",") if m.strip()
 ]
 
 _gemini_client = None
@@ -68,12 +63,10 @@ class GeminiTextResponse:
         self.output_text = text or ""
 
 def _gemini_models_to_try():
-    # Try the Render-configured model first, then user-configured fallbacks,
-    # then a built-in pool of current stable/free-tier Flash models. This means
-    # an old GEMINI_MODEL env var cannot lock the app to one overloaded model.
+    # Try the configured model first, then free-tier Flash fallbacks.
     seen = set()
     models = []
-    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS, *_BUILTIN_GEMINI_FALLBACK_MODELS]:
+    for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
         if model and model not in seen:
             seen.add(model)
             models.append(model)
@@ -89,16 +82,10 @@ def _is_gemini_transient_error(exc):
 def _gemini_generate_with_fallback(contents, config, purpose="text"):
     last_exc = None
     models = _gemini_models_to_try()
-    transient_errors = []
     for model in models:
-        # Give each model two chances, with exponential backoff, then move on.
-        for attempt in range(2):
+        for attempt in range(3):
             try:
-                response = get_gemini_client().models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                )
+                response = get_gemini_client().models.generate_content(model=model, contents=contents, config=config)
                 text = getattr(response, "text", None) or ""
                 if not text:
                     raise RuntimeError(f"Gemini returned an empty {purpose} response.")
@@ -107,17 +94,73 @@ def _gemini_generate_with_fallback(contents, config, purpose="text"):
                 last_exc = exc
                 if not _is_gemini_transient_error(exc):
                     raise
-                transient_errors.append(f"{model}: {type(exc).__name__}: {exc}")
-                # Google recommends exponential backoff for transient 429/5xx.
-                if attempt == 0:
-                    time.sleep(1.5)
-        # Model is temporarily busy/unavailable; immediately fail over.
+                if attempt < 2:
+                    time.sleep(1.5 * (2 ** attempt))
+    raise RuntimeError("Gemini is temporarily unavailable across the fallback pool. "
+                       f"Tried: {', '.join(models)}. Last error: {type(last_exc).__name__}: {last_exc}")
 
-    raise RuntimeError(
-        "Gemini is temporarily unavailable across the fallback pool. "
-        f"Tried: {', '.join(models)}. Last error: {type(last_exc).__name__}: {last_exc}. "
-        "The optimizer did not change Etsy."
-    )
+def _openai_models_to_try():
+    seen, models = set(), []
+    for model in [OPENAI_MODEL, *OPENAI_FALLBACK_MODELS]:
+        if model and model not in seen:
+            seen.add(model); models.append(model)
+    return models
+
+def _is_openai_transient(status_code, text):
+    msg = str(text).lower()
+    return status_code in {408, 409, 429, 500, 502, 503, 504} or any(x in msg for x in ["rate limit", "temporarily unavailable", "overloaded", "timeout"])
+
+def openai_generate_text(prompt, max_output_tokens=3000, json_mode=True):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+    last_exc = None
+    for model in _openai_models_to_try():
+        for attempt in range(3):
+            try:
+                payload = {"model": model, "input": prompt, "max_output_tokens": max_output_tokens}
+                if json_mode:
+                    payload["text"] = {"format": {"type": "json_object"}}
+                r = requests.post("https://api.openai.com/v1/responses",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                    json=payload, timeout=60)
+                if r.ok:
+                    data = r.json()
+                    text = data.get("output_text", "") or ""
+                    if not text:
+                        for item in data.get("output", []) or []:
+                            for content in item.get("content", []) or []:
+                                if content.get("type") in {"output_text", "text"} and content.get("text"):
+                                    text = content["text"]; break
+                            if text: break
+                    if text:
+                        return GeminiTextResponse(text)
+                    raise RuntimeError("OpenAI returned an empty response.")
+                body = r.text[:1000]
+                last_exc = RuntimeError(f"OpenAI HTTP {r.status_code}: {body}")
+                if not _is_openai_transient(r.status_code, body):
+                    break
+                if attempt < 2: time.sleep(2.0 * (2 ** attempt))
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < 2: time.sleep(2.0 * (2 ** attempt))
+            except Exception as exc:
+                last_exc = exc
+                break
+    raise RuntimeError("OpenAI fallback is unavailable. "
+                       f"Tried: {', '.join(_openai_models_to_try())}. Last error: {type(last_exc).__name__}: {last_exc}")
+
+def multi_provider_generate_text(prompt, max_output_tokens=3000, json_mode=True):
+    errors = []
+    try:
+        return gemini_generate_text(prompt, max_output_tokens=max_output_tokens, json_mode=json_mode)
+    except Exception as exc:
+        errors.append(f"Gemini: {type(exc).__name__}: {exc}")
+    if OPENAI_API_KEY:
+        try:
+            return openai_generate_text(prompt, max_output_tokens=max_output_tokens, json_mode=json_mode)
+        except Exception as exc:
+            errors.append(f"OpenAI: {type(exc).__name__}: {exc}")
+    raise RuntimeError("All configured AI providers are temporarily unavailable. " + " | ".join(errors) + " The optimizer did not change Etsy.")
 
 def gemini_generate_text(prompt, max_output_tokens=3000, json_mode=False):
     config_kwargs = {"max_output_tokens": max_output_tokens}
@@ -184,9 +227,10 @@ def home():
         "mode": "existing_listing_seo_optimizer",
         "optimizer_ui": "/optimizer",
         "docs": "/docs",
-        "ai_backend": "Google Gemini Free Tier",
+        "ai_backend": "Gemini primary + OpenAI fallback",
         "ai_model": GEMINI_MODEL,
         "ai_fallback_models": GEMINI_FALLBACK_MODELS,
+        "openai_fallback_enabled": bool(OPENAI_API_KEY),
     }
 
 
@@ -278,60 +322,48 @@ def etsy_public_headers():
     }
 
 
-def _etsy_response_is_transient(response):
-    return response.status_code in {429, 500, 502, 503, 504}
-
-
-def _etsy_retry_delay(response, attempt):
-    retry_after = response.headers.get("Retry-After")
-    try:
-        if retry_after:
-            return min(max(float(retry_after), 0.5), 8.0)
-    except (TypeError, ValueError):
-        pass
-    return min(0.8 * (2 ** attempt), 8.0)
-
+def _etsy_retryable(status_code):
+    return status_code in {408, 429, 500, 502, 503, 504}
 
 def etsy_get(url, access_token=None, params=None):
-    """GET Etsy with bounded retry/backoff for transient gateway/rate-limit errors."""
-    last_response = None
+    headers = etsy_headers(access_token) if access_token else etsy_public_headers()
     for attempt in range(4):
-        headers = etsy_headers(access_token) if access_token else etsy_public_headers()
         try:
             response = requests.get(url, headers=headers, params=params, timeout=20)
-        except requests.RequestException as exc:
-            if attempt >= 3:
-                raise HTTPException(status_code=503, detail=f"Etsy API connection failed after retries: {exc}")
-            time.sleep(min(0.8 * (2 ** attempt), 8.0))
-            continue
-
-        last_response = response
-
-        if access_token and response.status_code == 401:
-            refreshed = refresh_etsy_token()
-            if refreshed:
-                access_token = refreshed.get("access_token")
-                continue
-
-        if not _etsy_response_is_transient(response):
+            if access_token and response.status_code == 401:
+                refreshed = refresh_etsy_token()
+                if refreshed:
+                    access_token = refreshed.get("access_token")
+                    headers = etsy_headers(access_token)
+                    continue
+            if _etsy_retryable(response.status_code) and attempt < 3:
+                time.sleep(1.5 * (2 ** attempt)); continue
             return response
-
-        if attempt < 3:
-            time.sleep(_etsy_retry_delay(response, attempt))
-            continue
-        return response
-
-    return last_response
-
-
+        except requests.RequestException:
+            if attempt < 3:
+                time.sleep(1.5 * (2 ** attempt))
+            else:
+                raise
 
 def etsy_patch_form(url, access_token, data):
-    response = requests.patch(url, headers=etsy_form_headers(access_token), data=data, timeout=30)
-    if response.status_code == 401:
-        refreshed = refresh_etsy_token()
-        if refreshed:
-            response = requests.patch(url, headers=etsy_form_headers(refreshed.get("access_token")), data=data, timeout=30)
-    return response
+    headers = etsy_form_headers(access_token)
+    for attempt in range(4):
+        try:
+            response = requests.patch(url, headers=headers, data=data, timeout=40)
+            if response.status_code == 401:
+                refreshed = refresh_etsy_token()
+                if refreshed:
+                    access_token = refreshed.get("access_token")
+                    headers = etsy_form_headers(access_token)
+                    continue
+            if _etsy_retryable(response.status_code) and attempt < 3:
+                time.sleep(1.5 * (2 ** attempt)); continue
+            return response
+        except requests.RequestException:
+            if attempt < 3:
+                time.sleep(1.5 * (2 ** attempt))
+            else:
+                raise
 
 # -------------------------------------------------------------------
 # OAUTH
@@ -1067,7 +1099,7 @@ def ai_response_create(*, input_data, max_output_tokens=3000):
     returns malformed JSON, make one constrained repair call instead of crashing
     the whole optimizer.
     """
-    response = gemini_generate_text(
+    response = multi_provider_generate_text(
         input_data,
         max_output_tokens=max_output_tokens,
         json_mode=True,
@@ -1088,7 +1120,7 @@ Preserve the existing values exactly where possible.
 MODEL OUTPUT:
 {raw}
 """
-        repaired = gemini_generate_text(
+        repaired = multi_provider_generate_text(
             repair_prompt,
             max_output_tokens=max_output_tokens,
             json_mode=True,
@@ -1875,7 +1907,7 @@ def seo_score_report(current_listing, optimized_result, market_signals, validati
         "gaps": gaps,
         "note": (
             "Genuine internal SEO-quality score based on deterministic checks. "
-            "It is not Etsy's ranking score. V19 scores keyword coverage only "
+            "It is not Etsy's ranking score. V11 scores keyword coverage only "
             "against source/listing evidence or marketplace signals and never "
             "treats unavailable Etsy metadata as a failure."
         ),
@@ -2932,7 +2964,7 @@ def optimizer_page(listing_id: str = Query("")):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Etsy AI SEO Optimizer — V17</title>
+<title>Etsy AI SEO Optimizer — V20</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -3205,17 +3237,10 @@ async def analyze_existing_listing(
     )
 
     if not response.ok:
-        if response.status_code in {429, 500, 502, 503, 504}:
-            raise HTTPException(
-                status_code=503,
-                detail="Etsy API is temporarily unavailable (gateway/rate-limit response). The optimizer retried automatically. Please try Analyze again in a moment.",
-            )
-        try:
-            error_payload = response.json()
-            detail = error_payload.get("error") or error_payload.get("message") or str(error_payload)
-        except ValueError:
-            detail = f"Etsy API returned HTTP {response.status_code}."
-        raise HTTPException(status_code=response.status_code, detail=detail)
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text,
+        )
 
     listing = response.json()
 
@@ -3265,7 +3290,7 @@ async def analyze_existing_listing(
     best_score = -1
     best_errors = []
 
-    for round_no in range(5):
+    for round_no in range(6):
         candidate = {
             "title": optimized.get("recommended_title", ""),
             "tags": optimized.get("recommended_tags", []),
@@ -3304,7 +3329,7 @@ async def analyze_existing_listing(
 
         if score["is_genuine_100"]:
             break
-        if round_no == 4:
+        if round_no == 5:
             break
 
         optimized = improve_existing_listing_for_score(
